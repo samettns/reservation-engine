@@ -18,6 +18,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
@@ -79,39 +80,42 @@ class StrategyConcurrencyTest extends IntegrationTest {
     }
 
     /**
-     * A race condition is probabilistic: two transactions must read the stock inside the
-     * ~1 ms window before the first one commits. Measured: with stock=1 a single burst
-     * misses it roughly half the time (it failed once in a clean CI run). So the burst is
-     * repeated on a fresh event up to {@value #NAIVE_MAX_ROUNDS} times and at least one
-     * round must oversell (false failure odds ~0.5^20, about one in a million).
-     * That this is needed at all is the lesson: races slip through "it worked once" tests.
+     * Without help, the race is probabilistic: two transactions must read inside the ~1 ms
+     * between the first one's SELECT and commit. Measured: at stock=1 a single burst missed
+     * it about half the time. The test-only race window (a pause between read and write)
+     * makes it deterministic: every transaction that gets a connection reads before anyone
+     * writes, so with a 20-connection pool ~20 transactions read the same value every time.
+     * 50 ms is orders of magnitude wider than the gap between those reads.
      */
-    private static final int NAIVE_MAX_ROUNDS = 20;
+    private static final Duration NAIVE_RACE_WINDOW = Duration.ofMillis(50);
 
     @ParameterizedTest(name = "naive: stock={0}, 1000 concurrent requests -> OVERSELLS")
     @ValueSource(ints = {1, 100})
     void naiveStrategyOversells(int stock) {
-        ReservationService service = serviceWith("naive");
+        long eventId = events.create("concurrency-naive", stock);
+        var naive = new NaiveStrategy(jdbc, NAIVE_RACE_WINDOW);
+        ReservationService service = new ReservationService(naive, reservations, events, tx);
 
-        StockSnapshot oversold = null;
-        for (int round = 1; round <= NAIVE_MAX_ROUNDS && oversold == null; round++) {
-            long eventId = events.create("concurrency-naive", stock);
-            Tally tally = reserveConcurrently(service, eventId, REQUESTS);
-            StockSnapshot s = invariant.snapshot(eventId);
-            System.out.printf("[naive stock=%d round=%d] %s -> reserved=%d remaining=%d%n",
-                    stock, round, tally, s.reserved(), s.remaining());
-            assertThat(tally.unexpectedErrors()).isEmpty();
+        Tally tally = reserveConcurrently(service, eventId, REQUESTS);
+        StockSnapshot s = invariant.snapshot(eventId);
+        System.out.printf("[naive stock=%d] %s -> reserved=%d remaining=%d%n",
+                stock, tally, s.reserved(), s.remaining());
 
-            // Lost updates: more reservations exist than units that left the stock counter.
-            if (s.reserved() + s.remaining() > s.totalStock()) {
-                oversold = s;
-            }
-        }
+        assertThat(tally.unexpectedErrors()).isEmpty();
+        // Lost updates: more reservations exist than units that left the stock counter.
+        assertThat(s.reserved() + s.remaining())
+                .as("naive strategy must break conservation (lost updates)")
+                .isGreaterThan(s.totalStock());
+        assertThat(s.reserved()).as("more sold than exists").isGreaterThan(stock);
+    }
 
-        assertThat(oversold)
-                .as("naive strategy should break conservation within %d rounds", NAIVE_MAX_ROUNDS)
-                .isNotNull();
-        assertThat(oversold.reserved()).as("more sold than exists").isGreaterThan(stock);
+    @Test
+    void productionNaiveBeanHasNoRaceWindow() throws Exception {
+        NaiveStrategy bean = (NaiveStrategy) strategies.stream()
+                .filter(s -> s.name().equals("naive")).findFirst().orElseThrow();
+        var field = NaiveStrategy.class.getDeclaredField("raceWindow");
+        field.setAccessible(true);
+        assertThat((Duration) field.get(bean)).isZero();
     }
 
     @ParameterizedTest(name = "{0}: stock={1}, 100 concurrent retries of the SAME request -> exactly one reservation")

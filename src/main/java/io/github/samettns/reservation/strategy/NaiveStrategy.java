@@ -1,7 +1,10 @@
 package io.github.samettns.reservation.strategy;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
+
+import java.time.Duration;
 
 /**
  * ⚠️ INTENTIONALLY BROKEN. Exists only to demonstrate overselling.
@@ -18,9 +21,22 @@ import org.springframework.stereotype.Component;
 public class NaiveStrategy implements ReservationStrategy {
 
     private final JdbcClient jdbc;
+    private final Duration raceWindow;
 
+    /** Production constructor: no artificial delay, and there is no property to turn one on. */
+    @Autowired
     public NaiveStrategy(JdbcClient jdbc) {
+        this(jdbc, Duration.ZERO);
+    }
+
+    /**
+     * Test-only: widens the gap between read and write so that concurrent transactions
+     * deterministically read the same value. Package-private and not reachable from
+     * configuration, so the production bean can never get a delay.
+     */
+    NaiveStrategy(JdbcClient jdbc, Duration raceWindow) {
         this.jdbc = jdbc;
+        this.raceWindow = raceWindow;
     }
 
     @Override
@@ -38,10 +54,23 @@ public class NaiveStrategy implements ReservationStrategy {
             return false;
         }
         // Race window: other transactions may have read the same qty by now.
+        pauseForTests();
         jdbc.sql("UPDATE stock SET qty = :newQty WHERE event_id = :eventId")
                 .param("newQty", qty - 1)
                 .param("eventId", eventId)
                 .update();
         return true;
+    }
+
+    private void pauseForTests() {
+        if (raceWindow.isZero()) {
+            return;
+        }
+        try {
+            Thread.sleep(raceWindow);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(e);
+        }
     }
 }
