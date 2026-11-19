@@ -1,11 +1,62 @@
-# Local infrastructure. The application itself runs on the host for now;
-# stage 2 adds 3 app instances behind nginx for benchmarking.
+# Local infrastructure.
 #
-#   docker compose up -d        # start everything
-#   docker compose ps           # all services should be "healthy"
-#   docker compose down -v      # stop and delete data
+#   docker compose up -d                  # PostgreSQL, Redis, Kafka (app runs on the host)
+#   docker compose --profile bench up -d  # + 3 app instances behind nginx (benchmark setup)
+#   docker compose down -v                # stop and delete data
+#
+# The benchmark (bench/run-all.sh) starts only postgres, redis, app1-3 and nginx, so
+# Kafka does not compete for CPU/RAM during measurements.
+
+x-app: &app
+  image: reservation-engine:bench
+  profiles: ["bench"]
+  environment:
+    DB_URL: jdbc:postgresql://postgres:5432/reservation
+    REDIS_HOST: redis
+    RESERVATION_STRATEGY: ${RESERVATION_STRATEGY:-atomic}
+    # 3 instances x 20 = 60 connections, below PostgreSQL's default max_connections (100).
+    DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q UP"]
+    interval: 3s
+    timeout: 3s
+    retries: 30
 
 services:
+  # Instances are also published on 8081-8083 so the benchmark can scrape each one's
+  # /actuator/prometheus directly (through nginx you would hit a random instance).
+  # Only app1 builds the image; app2/app3 reuse it (three builds of one tag would conflict).
+  app1:
+    <<: *app
+    build: .
+    ports: ["8081:8080"]
+  app2:
+    <<: *app
+    pull_policy: never
+    ports: ["8082:8080"]
+  app3:
+    <<: *app
+    pull_policy: never
+    ports: ["8083:8080"]
+
+  nginx:
+    image: nginx:1.27-alpine
+    profiles: ["bench"]
+    ports: ["8000:80"]
+    volumes:
+      - ./bench/nginx.conf:/etc/nginx/nginx.conf:ro
+    ulimits:
+      nofile: 65535
+    depends_on:
+      app1: { condition: service_healthy }
+      app2: { condition: service_healthy }
+      app3: { condition: service_healthy }
+
   postgres:
     image: postgres:17-alpine
     environment:
