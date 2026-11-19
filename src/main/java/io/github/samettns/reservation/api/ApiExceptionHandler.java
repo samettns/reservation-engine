@@ -2,6 +2,7 @@ package io.github.samettns.reservation.api;
 
 import io.github.samettns.reservation.domain.EventNotFoundException;
 import io.github.samettns.reservation.domain.IdempotencyKeyReusedException;
+import io.github.samettns.reservation.domain.ReservationNotFoundException;
 import io.github.samettns.reservation.strategy.ContentionException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -14,8 +15,8 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 @RestControllerAdvice
 public class ApiExceptionHandler {
 
-    @ExceptionHandler(EventNotFoundException.class)
-    ProblemDetail eventNotFound(EventNotFoundException e) {
+    @ExceptionHandler({EventNotFoundException.class, ReservationNotFoundException.class})
+    ProblemDetail notFound(RuntimeException e) {
         return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, e.getMessage());
     }
 

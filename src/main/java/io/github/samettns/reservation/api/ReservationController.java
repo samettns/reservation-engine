@@ -1,5 +1,6 @@
 package io.github.samettns.reservation.api;
 
+import io.github.samettns.reservation.domain.ConfirmOutcome;
 import io.github.samettns.reservation.domain.Reservation;
 import io.github.samettns.reservation.domain.ReservationOutcome;
 import io.github.samettns.reservation.domain.ReservationService;
@@ -33,10 +34,12 @@ public class ReservationController {
     public record ReserveRequest(@NotBlank @Size(max = 64) String userId) {
     }
 
+    /** {@code expiresAt}: payment deadline while HELD (the client shows a countdown). */
     public record ReservationResponse(UUID reservationId, long eventId, String userId, String status,
-                                      OffsetDateTime createdAt) {
+                                      OffsetDateTime createdAt, OffsetDateTime expiresAt) {
         static ReservationResponse from(Reservation r) {
-            return new ReservationResponse(r.id(), r.eventId(), r.userId(), r.status().name(), r.createdAt());
+            return new ReservationResponse(r.id(), r.eventId(), r.userId(), r.status().name(),
+                    r.createdAt(), r.expiresAt());
         }
     }
 
@@ -59,6 +62,23 @@ public class ReservationController {
             case ReservationOutcome.SoldOut(long id) -> ResponseEntity
                     .status(HttpStatus.CONFLICT)
                     .body(ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, "Event " + id + " is sold out"));
+        };
+    }
+
+    /**
+     * Payment callback. 200 when confirmed (also on a retried callback), 410 Gone when the
+     * payment came after the deadline: the hold no longer exists and will not come back.
+     */
+    @PostMapping("/reservations/{reservationId}/confirm")
+    public ResponseEntity<?> confirm(@PathVariable UUID reservationId) {
+        return switch (service.confirm(reservationId)) {
+            case ConfirmOutcome.Confirmed(Reservation r) -> ResponseEntity.ok(ReservationResponse.from(r));
+            case ConfirmOutcome.AlreadyConfirmed(Reservation r) -> ResponseEntity.ok()
+                    .header(REPLAYED_HEADER, "true")
+                    .body(ReservationResponse.from(r));
+            case ConfirmOutcome.Expired(Reservation r) -> ResponseEntity.status(HttpStatus.GONE)
+                    .body(ProblemDetail.forStatusAndDetail(HttpStatus.GONE,
+                            "Hold " + r.id() + " expired at " + r.expiresAt() + "; payment was too late"));
         };
     }
 }

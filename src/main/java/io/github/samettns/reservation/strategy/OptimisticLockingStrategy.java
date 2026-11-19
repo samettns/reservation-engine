@@ -1,5 +1,6 @@
 package io.github.samettns.reservation.strategy;
 
+import java.util.OptionalInt;
 import io.github.samettns.reservation.strategy.StockShards.RowResult;
 import io.github.samettns.reservation.strategy.StockShards.ShardRow;
 import io.micrometer.core.instrument.DistributionSummary;
@@ -74,7 +75,7 @@ public class OptimisticLockingStrategy implements ReservationStrategy {
     }
 
     @Override
-    public boolean tryAcquireOne(long eventId) {
+    public OptionalInt tryAcquireOne(long eventId) {
         return shards.acquire(eventId, this::tryRow);
     }
 

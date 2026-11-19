@@ -70,8 +70,16 @@ public class EventRepository {
                                e.total_stock,
                                e.shard_count,
                                (SELECT COALESCE(SUM(s.qty), 0) FROM stock s WHERE s.event_id = e.id) AS remaining,
-                               (SELECT count(*) FROM reservations r WHERE r.event_id = e.id) AS reserved
+                               r.held,
+                               r.confirmed,
+                               r.expired
                         FROM events e
+                        CROSS JOIN LATERAL (
+                            SELECT count(*) FILTER (WHERE status = 'HELD')      AS held,
+                                   count(*) FILTER (WHERE status = 'CONFIRMED') AS confirmed,
+                                   count(*) FILTER (WHERE status = 'EXPIRED')   AS expired
+                            FROM reservations WHERE event_id = e.id
+                        ) r
                         WHERE e.id = :id
                         """)
                 .param("id", eventId)
@@ -79,9 +87,27 @@ public class EventRepository {
                         rs.getLong("id"),
                         rs.getInt("total_stock"),
                         rs.getInt("remaining"),
-                        rs.getInt("reserved"),
+                        rs.getInt("held") + rs.getInt("confirmed"),
+                        rs.getInt("held"),
+                        rs.getInt("confirmed"),
+                        rs.getInt("expired"),
                         rs.getInt("shard_count")))
                 .optional();
+    }
+
+    /**
+     * Gives {@code units} back to one shard. Bumps the version too, so an optimistic-locking
+     * reader that saw the old row retries instead of overwriting the returned units.
+     */
+    public void returnStock(long eventId, int shardNo, int units) {
+        jdbc.sql("""
+                        UPDATE stock SET qty = qty + :units, version = version + 1
+                        WHERE event_id = :eventId AND shard_no = :shardNo
+                        """)
+                .param("units", units)
+                .param("eventId", eventId)
+                .param("shardNo", shardNo)
+                .update();
     }
 
     /** Remaining stock per shard, ordered by shard number. */

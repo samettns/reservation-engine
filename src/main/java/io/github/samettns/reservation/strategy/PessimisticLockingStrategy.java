@@ -1,5 +1,6 @@
 package io.github.samettns.reservation.strategy;
 
+import java.util.OptionalInt;
 import io.github.samettns.reservation.strategy.StockShards.RowResult;
 import io.github.samettns.reservation.strategy.StockShards.ShardRow;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -42,7 +43,7 @@ public class PessimisticLockingStrategy implements ReservationStrategy {
     }
 
     @Override
-    public boolean tryAcquireOne(long eventId) {
+    public OptionalInt tryAcquireOne(long eventId) {
         return shards.acquire(eventId, this::tryRow);
     }
 

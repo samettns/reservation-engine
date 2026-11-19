@@ -1,5 +1,7 @@
 package io.github.samettns.reservation.strategy;
 
+import java.util.OptionalInt;
+
 /**
  * How one unit of stock is taken from an event. This is the only part that differs
  * between the strategies we compare; everything around it (idempotency, persisting the
@@ -16,9 +18,10 @@ public interface ReservationStrategy {
     /**
      * Tries to take one unit of stock.
      *
-     * @return {@code true} if a unit was taken, {@code false} if the event is sold out
+     * @return the shard number the unit was taken from (stored on the reservation so an
+     *         expired hold gives the unit back to the same shard), or empty if sold out
      * @throws ContentionException if the strategy gave up because of too much contention;
      *                             stock may still be available and the client may retry
      */
-    boolean tryAcquireOne(long eventId);
+    OptionalInt tryAcquireOne(long eventId);
 }

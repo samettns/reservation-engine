@@ -10,6 +10,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.List;
+import java.util.OptionalInt;
 
 /**
  * Redis as an admission gate in front of the database.
@@ -30,10 +31,12 @@ import java.util.List;
  *   <li>Process crashes between DECR and commit: the callback never runs, Redis stays one
  *       lower than the DB. Needs a reconciliation job (stage 7).</li>
  *   <li>Redis says yes but the DB says sold out: we trust the DB and log the drift.</li>
+ *   <li>Expired holds return stock to the DB: mirrored into Redis after the DB commit
+ *       ({@link #onStockReturned}).</li>
  * </ul>
  */
 @Component
-public class RedisGateStrategy implements ReservationStrategy {
+public class RedisGateStrategy implements ReservationStrategy, StockReturnListener {
 
     private static final Logger log = LoggerFactory.getLogger(RedisGateStrategy.class);
 
@@ -52,6 +55,14 @@ public class RedisGateStrategy implements ReservationStrategy {
             end
             redis.call('DECR', KEYS[1])
             return 1
+            """, Long.class);
+
+    /** INCRBY only if the counter exists (never creates a counter from a partial value). */
+    private static final RedisScript<Long> INCREMENT_IF_PRESENT = RedisScript.of("""
+            if redis.call('EXISTS', KEYS[1]) == 1 then
+                return redis.call('INCRBY', KEYS[1], ARGV[1])
+            end
+            return -1
             """, Long.class);
 
     private final StringRedisTemplate redis;
@@ -74,7 +85,7 @@ public class RedisGateStrategy implements ReservationStrategy {
     }
 
     @Override
-    public boolean tryAcquireOne(long eventId) {
+    public OptionalInt tryAcquireOne(long eventId) {
         if (!TransactionSynchronizationManager.isSynchronizationActive()) {
             // Without a transaction we could not undo the Redis decrement on rollback.
             throw new IllegalStateException("RedisGateStrategy must run inside a transaction");
@@ -87,7 +98,7 @@ public class RedisGateStrategy implements ReservationStrategy {
             result = runGate(key);
         }
         if (result == SOLD_OUT) {
-            return false;
+            return OptionalInt.empty();
         }
 
         // From here on Redis has been decremented: give the unit back if the DB transaction
@@ -101,11 +112,30 @@ public class RedisGateStrategy implements ReservationStrategy {
             }
         });
 
-        boolean acquiredInDatabase = database.tryAcquireOne(eventId);
-        if (!acquiredInDatabase) {
+        OptionalInt shard = database.tryAcquireOne(eventId);
+        if (shard.isEmpty()) {
             log.warn("Redis/DB drift on event {}: Redis allowed a reservation but the DB is sold out", eventId);
         }
-        return acquiredInDatabase;
+        return shard;
+    }
+
+    /**
+     * An expired hold gave units back to the DB: give them back to the gate too, otherwise Redis
+     * keeps saying "sold out" while the DB has stock again. Applied only AFTER the DB commit (if
+     * the return rolls back, Redis must not change). If the process dies between the commit and
+     * this INCRBY, Redis stays lower than the DB: the safe direction (undersell), fixed by the
+     * reconciliation job planned for stage 7. A missing key is left alone: lazy initialisation
+     * will read the already-returned stock from the DB.
+     */
+    @Override
+    public void onStockReturned(long eventId, int units) {
+        String key = stockKey(eventId);
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                redis.execute(INCREMENT_IF_PRESENT, List.of(key), Integer.toString(units));
+            }
+        });
     }
 
     private long runGate(String key) {

@@ -7,6 +7,7 @@ import io.github.samettns.reservation.domain.StockSnapshot;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -22,6 +23,8 @@ class ReservationApiTest extends IntegrationTest {
 
     @Autowired
     TestRestTemplate http;
+    @Autowired
+    JdbcClient jdbc;
 
     @Test
     void reservesUntilSoldOut() {
@@ -137,6 +140,40 @@ class ReservationApiTest extends IntegrationTest {
                     "/events", Map.of("name", "bad", "stock", 10, "shards", shards), ProblemDetail.class);
             assertThat(response.getStatusCode()).as("shards=%d", shards).isEqualTo(HttpStatus.BAD_REQUEST);
         }
+    }
+
+    @Test
+    void paymentConfirmationEndpoint() {
+        long eventId = createEvent(5);
+        ResponseEntity<ReservationResponse> held = reserveTyped(eventId, "alice", newKey());
+        assertThat(held.getBody().status()).isEqualTo("HELD");
+        assertThat(held.getBody().expiresAt()).isNotNull();
+        UUID id = held.getBody().reservationId();
+
+        ResponseEntity<ReservationResponse> confirmed =
+                http.postForEntity("/reservations/{id}/confirm", null, ReservationResponse.class, id);
+        assertThat(confirmed.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(confirmed.getBody().status()).isEqualTo("CONFIRMED");
+
+        ResponseEntity<ReservationResponse> retried =
+                http.postForEntity("/reservations/{id}/confirm", null, ReservationResponse.class, id);
+        assertThat(retried.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(retried.getHeaders().getFirst(ReservationController.REPLAYED_HEADER)).isEqualTo("true");
+
+        assertThat(http.postForEntity("/reservations/{id}/confirm", null, ProblemDetail.class, UUID.randomUUID())
+                .getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    @Test
+    void paymentAfterDeadlineReturns410Gone() {
+        long eventId = createEvent(5);
+        UUID id = reserveTyped(eventId, "alice", newKey()).getBody().reservationId();
+        jdbc.sql("UPDATE reservations SET expires_at = now() - interval '1 second' WHERE id = :id")
+                .param("id", id).update();
+
+        ResponseEntity<ProblemDetail> late =
+                http.postForEntity("/reservations/{id}/confirm", null, ProblemDetail.class, id);
+        assertThat(late.getStatusCode()).isEqualTo(HttpStatus.GONE);
     }
 
     // --- helpers -------------------------------------------------------------

@@ -3,6 +3,7 @@ package io.github.samettns.reservation.strategy;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
 
+import java.util.OptionalInt;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
@@ -53,10 +54,10 @@ public class StockShards {
     }
 
     /**
-     * @return {@code true} if some shard gave us a unit, {@code false} if every shard was empty
+     * @return the shard that gave us a unit, or empty if every shard was empty
      * @throws ContentionException if no shard gave a unit and at least one gave up due to contention
      */
-    public boolean acquire(long eventId, RowAttempt attempt) {
+    public OptionalInt acquire(long eventId, RowAttempt attempt) {
         int shards = shardCount(eventId);
         int start = shards == 1 ? 0 : ThreadLocalRandom.current().nextInt(shards);
         boolean contended = false;
@@ -64,7 +65,7 @@ public class StockShards {
             ShardRow row = new ShardRow(eventId, (start + i) % shards, shards);
             switch (attempt.tryRow(row)) {
                 case ACQUIRED -> {
-                    return true;
+                    return OptionalInt.of(row.shardNo());
                 }
                 case EMPTY -> {
                     // try the next shard
@@ -75,7 +76,7 @@ public class StockShards {
         if (contended) {
             throw new ContentionException(eventId, "no shard could be acquired; at least one was contended");
         }
-        return false;
+        return OptionalInt.empty();
     }
 
     public int shardCount(long eventId) {
