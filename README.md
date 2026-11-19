@@ -83,10 +83,10 @@ karşılaştırma için. Tam tablo: [`docs/benchmarks/summary.md`](docs/benchmar
   <img alt="Sellout: requests per second" src="docs/benchmarks/sellout-throughput.png">
 </picture>
 
-- **`pessimistic` 3–3,5 kat yavaş:** "Tükendi" yanıtı vermek için bile `FOR UPDATE` ile satırı kilitliyor,
+- **`pessimistic` 2,7–3,8 kat yavaş:** "Tükendi" yanıtı vermek için bile `FOR UPDATE` ile satırı kilitliyor,
   yani reddetmeler de sıraya giriyor. `atomic`te koşulu sağlamayan UPDATE satırı kilitlemiyor; reddetmeler
   paralel.
-- **`redis` `atomic`ten sadece %0–10 hızlı.** Redis UPDATE'i atlatıyor, ama her istek yine PostgreSQL'de 2–3
+- **`redis` ile `atomic` arasındaki fark −%1 ile +%11 arasında.** Redis UPDATE'i atlatıyor, ama her istek yine PostgreSQL'de 2–3
   sorgu yapıyor (idempotency kontrolü, etkinlik kontrolü, "tükendi" öncesi tekrar kontrol). Darboğaz satır
   kilidi değil, veritabanı gidiş-dönüşleri.
 
@@ -106,11 +106,12 @@ karşılaştırma için. Tam tablo: [`docs/benchmarks/summary.md`](docs/benchmar
 ~0,06. Maksimum retry: 2–3 (deneme hakkı 10). PostgreSQL'de koşullu UPDATE de satır kilidini beklediği için
 kaybedenler "boşa dönmek" yerine sıraya giriyor. Ayrıntı: [`optimistic-retries.png`](docs/benchmarks/optimistic-retries.png).
 
-**Naif strateji** tüm koşularda overselling yaptı: flaş satışta 1.000 stok için **20.655** rezervasyon
-(`oversold = 19.655`). Hızlı ama yanlış.
+**Naif strateji** tüm koşularda overselling yaptı: flaş satışta (100 VU) 1.000 stok için **20.000
+rezervasyon**, yani isteklerin tamamı başarılı. Üstelik stok sayacı hâlâ 655 gösteriyordu (`oversold = 19.655`).
+Hızlı ama yanlış.
 
-**Ölçüm sınırlamaları:** Her hücre tek koşu (tekrar ve güven aralığı yok; kısa denemelerde koşudan koşuya
-±%30'a varan fark gözlendi). k6 ve uygulamalar aynı CPU'yu paylaşıyor. Disk WSL2 sanal diski
+**Ölçüm sınırlamaları:** Her hücre tek koşu (tekrar ve güven aralığı yok; kısa denemelerle tam koşu arasında
+%40'a varan fark gözlendi). k6 ve uygulamalar aynı CPU'yu paylaşıyor. Disk WSL2 sanal diski
 (fsync maliyeti gerçek sunucudan farklı).
 
 ## Bilinen sınırlamalar
