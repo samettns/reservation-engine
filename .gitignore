@@ -14,6 +14,9 @@ target/
 .DS_Store
 Thumbs.db
 
+# Personal study notes (kept local, never committed)
+notes/
+
 # Benchmark outputs (generated)
 bench/results/*.csv
 bench/results/*.json
