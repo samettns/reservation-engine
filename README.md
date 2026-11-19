@@ -232,6 +232,37 @@ HELD --(süre doldu, sweeper)----> EXPIRED   (birim, alındığı shard'a geri d
   3 sn TTL. Hepsi tam bir kez sona erdi (instance başına 1.054 / 607 / 1.339) ve her shard yeniden 750 birime
   döndü.
 
+## Olaylar: transactional outbox ve Kafka (Aşama 5a)
+
+Her durum değişikliği (`ReservationHeld`, `ReservationConfirmed`, `ReservationExpired`) bir Kafka olayı üretir.
+
+**Problem (dual write).** Veritabanına ve Kafka'ya ayrı ayrı yazmak iki şekilde bozulur; ikisi de testle
+gösteriliyor:
+- **Commit edildi, Kafka'ya gönderilmeden çökme:** Olay sonsuza kadar kayboldu.
+- **Kafka'ya gönderildi, sonra DB transaction'ı geri alındı:** Hiç olmamış bir değişiklik için "hayalet" olay.
+
+**Çözüm: transactional outbox.** Olay, durum değişikliğiyle **aynı transaction'da** `outbox` tablosuna bir satır
+olarak yazılıyor. İkisi birlikte commit ya da rollback oluyor. Her instance'ta çalışan bir **polling relay**
+yayınlanmamış satırları alıp Kafka'ya gönderiyor ve broker onayından sonra yayınlandı olarak işaretliyor.
+
+| Garanti | Nasıl |
+|---|---|
+| Olay kaybı yok | Olay DB'de; relay gönderemezse satır yayınlanmamış kalır ve tekrar denenir |
+| Paralel relay'ler aynı satırı aynı anda yayınlamaz | `FOR UPDATE SKIP LOCKED` |
+| Bir rezervasyonun olayları sırayla gider | Kafka key = rezervasyon ID'si (aynı partition) **ve** bir rezervasyonun bir olayı, ancak daha eski olayları yayınlandıktan sonra seçilebilir. Aksi halde iki relay olayları ters sırayla gönderebilir ve key yanlış sırayı korur. |
+| Teslimat **at-least-once** (kabul edildi) | Gönderim ile "yayınlandı" işareti atomik olamaz; arada çökme olursa olay tekrar gönderilir |
+| Etki **tam bir kez** | Consumer, mesaj ID'sini etkiyle aynı transaction'da `consumer_inbox`'a yazar; gördüğü mesajı atlar |
+
+**Kanıtlar:**
+- 3 paralel relay 500 olayı tam bir kez yayınladı (160 / 180 / 160).
+- Kasıtlı tekrar gönderimde Kafka'da her mesaj 2 kez vardı, etki yine 1 kez uygulandı.
+- Deterministik test: A relay'i bir rezervasyonun `Held` olayını gönderirken, B relay'i aynı rezervasyonun
+  `Confirmed` olayına dokunmuyor.
+- Mutasyonlar: sıra koruması, inbox ve Kafka key'i ayrı ayrı kaldırılınca testler kırmızıya dönüyor.
+- **Canlı, 3 container ve gerçek Kafka** (`bash bench/verify-events-live.sh`): 3.000 olayın hepsi yayınlandı
+  (relay başına 1.215 / 1.083 / 702). 3.000 bildirim oluştu (consumer başına 1.019 / 998 / 983). Sırası bozuk
+  rezervasyon 0.
+
 ## Bilinen sınırlamalar
 
 | Sınırlama | Etki | Çözüm planı |
@@ -239,5 +270,7 @@ HELD --(süre doldu, sweeper)----> EXPIRED   (birim, alındığı shard'a geri d
 | **Redis stratejisinde eşzamanlı idempotent tekrarlar.** Aynı `Idempotency-Key` ile gelen kopyalar, ilk istek henüz commit edilmemişken Redis sayacını geçici olarak 0 görüp `409` alabilir. | Stok doğru kalır (overselling yok), ama başarılı olmuş bir isteğin kopyasına "tükendi" denir. Ölçüm: stok 1'de 100 eşzamanlı kopyadan ~8'i. DB stratejileri etkilenmez. | Aşama 5: istek işlenirken idempotency kaydını "işlemde" olarak tutmak. |
 | **Sharding'de "tükendi" yanıtı bütün shard'ları geziyor.** | 16 shard'da flaş satış %22–47 yavaşlıyor. | Aşama 5: "tükendi" kısayolu / işareti (Redis kısayoluyla birlikte). |
 | **İade edilen stok ile "tükendi" işareti.** Süresi dolan rezervasyonlar stoğu geri getiriyor. | Aşama 5'te eklenecek "tükendi" işareti ve Redis kısayolu, stok iade edildiğinde temizlenmezse geri gelen birimler bir daha satılamaz. | Aşama 5 tasarımının parçası (iade = işareti temizle). |
+| **Zehirli mesaj partition'ı durdurabilir.** Consumer'da işlenemeyen bir mesaj yeniden denenirken aynı partition'daki sonraki mesajlar bekliyor (geliştirme sırasında bir NULL hatasıyla yaşandı). | Bir hata, bir partition'daki bütün olayları geciktirir. | Aşama 7: dead-letter topic. |
+| **Outbox tablosu büyüyor.** Yayınlanmış satırlar silinmiyor. | Disk kullanımı zamanla artar. | Saklama süresi dolanları silen bir temizlik işi (kapsam dışı, not edildi). |
 | **Shard sayısı etkinlik oluşturulurken sabitleniyor.** | Yayındaki bir etkinliğin shard sayısı değiştirilemez (resharding yok). | Kapsam dışı. |
 | **Redis düşüşü ile DB sonucu arasında çökme.** Redis'ten birim düşüldükten sonra, DB transaction'ı sonuçlanıp telafi (`INCR`) çalışmadan uygulama çökerse, düşülen birim Redis'e hiç iade edilmez. | Redis sayacı DB'den düşük kalır: o birimler satılamaz (undersell). Overselling'e yol açmaz, çünkü son kararı DB veriyor. | Aşama 7: Redis sayacını DB'deki kalan stokla eşitleyen bir mutabakat (reconciliation) işi. |
