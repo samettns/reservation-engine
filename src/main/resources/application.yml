@@ -1,0 +1,35 @@
+spring:
+  application:
+    name: reservation-engine
+
+  # Every request runs on its own virtual thread. Note: this does NOT raise the
+  # number of concurrent DB operations; the Hikari pool below is the real limit.
+  threads:
+    virtual:
+      enabled: true
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/reservation}
+    username: ${DB_USER:reservation}
+    password: ${DB_PASSWORD:reservation}
+    hikari:
+      # Set explicitly (default is 10) because it is one of the main knobs in the benchmarks.
+      maximum-pool-size: ${DB_POOL_SIZE:20}
+      connection-timeout: ${DB_CONNECTION_TIMEOUT_MS:5000}
+
+  flyway:
+    locations: classpath:db/migration
+
+  mvc:
+    # RFC 9457 (Problem Details) bodies for framework errors such as a missing header.
+    problemdetails:
+      enabled: true
+
+server:
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
