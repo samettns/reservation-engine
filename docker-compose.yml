@@ -16,6 +16,8 @@ x-app: &app
     RESERVATION_STRATEGY: ${RESERVATION_STRATEGY:-atomic}
     # 3 instances x 20 = 60 connections, below PostgreSQL's default max_connections (100).
     DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+    HOLD_TTL: ${HOLD_TTL:-PT10M}
+    EXPIRY_INTERVAL: ${EXPIRY_INTERVAL:-PT1S}
   depends_on:
     postgres:
       condition: service_healthy
