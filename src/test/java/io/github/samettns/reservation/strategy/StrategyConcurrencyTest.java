@@ -35,10 +35,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 class StrategyConcurrencyTest extends IntegrationTest {
 
     private static final int REQUESTS = 1_000;
-    private static final List<String> CORRECT_STRATEGIES = List.of("atomic", "optimistic", "pessimistic", "redis");
+    private static final List<String> CORRECT_STRATEGIES =
+            List.of("atomic", "optimistic", "pessimistic", "pessimistic-precheck", "redis");
 
     @Autowired
     List<ReservationStrategy> strategies;
+    @Autowired
+    StockShards stockShards;
     @Autowired
     ReservationRepository reservations;
     @Autowired
@@ -50,19 +53,21 @@ class StrategyConcurrencyTest extends IntegrationTest {
     @Autowired
     JdbcClient jdbc;
 
+    /** Every correct strategy x stock {1, 100} x shards {1, 8}. stock=1 with 8 shards leaves 7 shards empty. */
     static Stream<Arguments> correctStrategiesAndStock() {
-        return CORRECT_STRATEGIES.stream()
-                .flatMap(name -> Stream.of(Arguments.of(name, 1), Arguments.of(name, 100)));
+        return CORRECT_STRATEGIES.stream().flatMap(name -> Stream.of(
+                Arguments.of(name, 1, 1), Arguments.of(name, 100, 1),
+                Arguments.of(name, 1, 8), Arguments.of(name, 100, 8)));
     }
 
-    @ParameterizedTest(name = "{0}: stock={1}, 1000 concurrent requests -> no overselling")
+    @ParameterizedTest(name = "{0}: stock={1}, shards={2}, 1000 concurrent requests -> no overselling")
     @MethodSource("correctStrategiesAndStock")
-    void correctStrategiesNeverOversell(String strategyName, int stock) {
-        long eventId = events.create("concurrency-" + strategyName, stock);
+    void correctStrategiesNeverOversell(String strategyName, int stock, int shards) {
+        long eventId = events.create("concurrency-" + strategyName, stock, shards);
         ReservationService service = serviceWith(strategyName);
 
         Tally tally = reserveConcurrently(service, eventId, REQUESTS);
-        System.out.printf("[%s stock=%d] %s%n", strategyName, stock, tally);
+        System.out.printf("[%s stock=%d shards=%d] %s%n", strategyName, stock, shards, tally);
 
         assertThat(tally.unexpectedErrors()).as("unexpected exceptions").isEmpty();
         StockSnapshot snapshot = invariant.assertHolds(eventId, tally.created());
@@ -79,6 +84,41 @@ class StrategyConcurrencyTest extends IntegrationTest {
         if (strategyName.equals("redis")) {
             invariant.assertRedisMatchesDatabase(eventId);
         }
+        if (!strategyName.equals("optimistic")) {
+            assertThat(events.shardQuantities(eventId)).as("every shard drained").containsOnly(0);
+        }
+    }
+
+    /**
+     * The sharding trade-off to guard against: a request lands on an empty shard while other
+     * shards still have stock. It must move on, not answer "sold out". Requests are sequential
+     * so every refusal before the end would be a false "sold out".
+     */
+    @ParameterizedTest(name = "{0}: 8 shards, unevenly drained -> never 'sold out' while stock remains")
+    @MethodSource("correctStrategyNames")
+    void shardedEventNeverAnswersSoldOutWhileStockRemains(String strategyName) {
+        long eventId = events.create("sharded-no-false-sold-out-" + strategyName, 10, 8); // shards: 2,2,1,1,1,1,1,1
+        ReservationService service = serviceWith(strategyName);
+
+        for (int i = 0; i < 10; i++) {
+            ReservationOutcome outcome = service.reserve(eventId, "user-" + i, "event-" + eventId + "-key-" + i);
+            assertThat(outcome).as("request %d of 10", i + 1).isInstanceOf(ReservationOutcome.Created.class);
+        }
+        assertThat(service.reserve(eventId, "late", "event-" + eventId + "-late"))
+                .isInstanceOf(ReservationOutcome.SoldOut.class);
+        assertThat(events.shardQuantities(eventId)).containsOnly(0);
+        invariant.assertHolds(eventId, 10);
+    }
+
+    @Test
+    void stockIsSplitAsEvenlyAsPossibleAcrossShards() {
+        assertThat(events.shardQuantities(events.create("split", 10, 4))).containsExactly(3, 3, 2, 2);
+        assertThat(events.shardQuantities(events.create("split", 1, 4))).containsExactly(1, 0, 0, 0);
+        assertThat(events.shardQuantities(events.create("split", 100, 1))).containsExactly(100);
+    }
+
+    static Stream<String> correctStrategyNames() {
+        return CORRECT_STRATEGIES.stream();
     }
 
     /**
@@ -95,7 +135,7 @@ class StrategyConcurrencyTest extends IntegrationTest {
     @ValueSource(ints = {1, 100})
     void naiveStrategyOversells(int stock) {
         long eventId = events.create("concurrency-naive", stock);
-        var naive = new NaiveStrategy(jdbc, NAIVE_RACE_WINDOW);
+        var naive = new NaiveStrategy(jdbc, stockShards, NAIVE_RACE_WINDOW);
         ReservationService service = new ReservationService(naive, reservations, events, tx);
 
         Tally tally = reserveConcurrently(service, eventId, REQUESTS);
@@ -162,7 +202,7 @@ class StrategyConcurrencyTest extends IntegrationTest {
         long eventId = events.create("optimistic-exhaustion", 1_000);
         // One attempt only: anyone who loses the first race must give up.
         var meters = new SimpleMeterRegistry();
-        var oneShot = new OptimisticLockingStrategy(jdbc, 1, meters);
+        var oneShot = new OptimisticLockingStrategy(jdbc, stockShards, 1, meters);
         ReservationService service = new ReservationService(oneShot, reservations, events, tx);
 
         Tally tally = reserveConcurrently(service, eventId, 200);
@@ -180,7 +220,7 @@ class StrategyConcurrencyTest extends IntegrationTest {
     void optimisticAttemptsMetricCountsRetries() {
         long eventId = events.create("optimistic-metrics", 1_000_000);
         var meters = new SimpleMeterRegistry();
-        var strategy = new OptimisticLockingStrategy(jdbc, 10, meters);
+        var strategy = new OptimisticLockingStrategy(jdbc, stockShards, 10, meters);
         ReservationService service = new ReservationService(strategy, reservations, events, tx);
 
         Tally tally = reserveConcurrently(service, eventId, 500);

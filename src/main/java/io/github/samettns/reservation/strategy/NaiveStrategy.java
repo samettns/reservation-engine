@@ -1,5 +1,6 @@
 package io.github.samettns.reservation.strategy;
 
+import io.github.samettns.reservation.strategy.StockShards.RowResult;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
@@ -21,12 +22,13 @@ import java.time.Duration;
 public class NaiveStrategy implements ReservationStrategy {
 
     private final JdbcClient jdbc;
+    private final StockShards shards;
     private final Duration raceWindow;
 
     /** Production constructor: no artificial delay, and there is no property to turn one on. */
     @Autowired
-    public NaiveStrategy(JdbcClient jdbc) {
-        this(jdbc, Duration.ZERO);
+    public NaiveStrategy(JdbcClient jdbc, StockShards shards) {
+        this(jdbc, shards, Duration.ZERO);
     }
 
     /**
@@ -34,8 +36,9 @@ public class NaiveStrategy implements ReservationStrategy {
      * deterministically read the same value. Package-private and not reachable from
      * configuration, so the production bean can never get a delay.
      */
-    NaiveStrategy(JdbcClient jdbc, Duration raceWindow) {
+    NaiveStrategy(JdbcClient jdbc, StockShards shards, Duration raceWindow) {
         this.jdbc = jdbc;
+        this.shards = shards;
         this.raceWindow = raceWindow;
     }
 
@@ -46,20 +49,26 @@ public class NaiveStrategy implements ReservationStrategy {
 
     @Override
     public boolean tryAcquireOne(long eventId) {
-        int qty = jdbc.sql("SELECT qty FROM stock WHERE event_id = :eventId")
+        return shards.acquire(eventId, this::tryRow);
+    }
+
+    private RowResult tryRow(long eventId, int shardNo) {
+        int qty = jdbc.sql("SELECT qty FROM stock WHERE event_id = :eventId AND shard_no = :shardNo")
                 .param("eventId", eventId)
+                .param("shardNo", shardNo)
                 .query(Integer.class)
                 .single();
         if (qty <= 0) {
-            return false;
+            return RowResult.EMPTY;
         }
         // Race window: other transactions may have read the same qty by now.
         pauseForTests();
-        jdbc.sql("UPDATE stock SET qty = :newQty WHERE event_id = :eventId")
+        jdbc.sql("UPDATE stock SET qty = :newQty WHERE event_id = :eventId AND shard_no = :shardNo")
                 .param("newQty", qty - 1)
                 .param("eventId", eventId)
+                .param("shardNo", shardNo)
                 .update();
-        return true;
+        return RowResult.ACQUIRED;
     }
 
     private void pauseForTests() {

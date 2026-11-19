@@ -117,7 +117,9 @@ public class RedisGateStrategy implements ReservationStrategy {
      * instances) race to initialise: only the first one writes, the rest keep its value.
      */
     private void initialiseFromDatabase(long eventId, String key) {
-        int dbQty = jdbc.sql("SELECT qty FROM stock WHERE event_id = :eventId")
+        // One Redis counter per event, whatever the number of DB shards: the gate only needs
+        // the total; the DB step (AtomicUpdateStrategy) picks the shard.
+        int dbQty = jdbc.sql("SELECT COALESCE(SUM(qty), 0) FROM stock WHERE event_id = :eventId")
                 .param("eventId", eventId)
                 .query(Integer.class)
                 .single();

@@ -1,5 +1,6 @@
 package io.github.samettns.reservation.strategy;
 
+import io.github.samettns.reservation.strategy.StockShards.RowResult;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
 
@@ -7,14 +8,18 @@ import org.springframework.stereotype.Component;
  * Check and decrement in ONE statement. PostgreSQL takes a row lock for the UPDATE and
  * re-evaluates {@code qty > 0} against the latest committed row version, so two
  * concurrent requests can never both take the last unit. No explicit lock, no retry.
+ * An UPDATE whose condition is false changes nothing and takes no lock, which is why
+ * "sold out" answers are cheap and run in parallel.
  */
 @Component
 public class AtomicUpdateStrategy implements ReservationStrategy {
 
     private final JdbcClient jdbc;
+    private final StockShards shards;
 
-    public AtomicUpdateStrategy(JdbcClient jdbc) {
+    public AtomicUpdateStrategy(JdbcClient jdbc, StockShards shards) {
         this.jdbc = jdbc;
+        this.shards = shards;
     }
 
     @Override
@@ -24,9 +29,17 @@ public class AtomicUpdateStrategy implements ReservationStrategy {
 
     @Override
     public boolean tryAcquireOne(long eventId) {
-        int updatedRows = jdbc.sql("UPDATE stock SET qty = qty - 1 WHERE event_id = :eventId AND qty > 0")
+        return shards.acquire(eventId, this::tryRow);
+    }
+
+    private RowResult tryRow(long eventId, int shardNo) {
+        int updatedRows = jdbc.sql("""
+                        UPDATE stock SET qty = qty - 1
+                        WHERE event_id = :eventId AND shard_no = :shardNo AND qty > 0
+                        """)
                 .param("eventId", eventId)
+                .param("shardNo", shardNo)
                 .update();
-        return updatedRows == 1;
+        return updatedRows == 1 ? RowResult.ACQUIRED : RowResult.EMPTY;
     }
 }

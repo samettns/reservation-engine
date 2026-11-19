@@ -114,6 +114,31 @@ class ReservationApiTest extends IntegrationTest {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
+    @Test
+    void createsShardedEventAndReportsTotalAcrossShards() {
+        ResponseEntity<EventCreatedResponse> created = http.postForEntity(
+                "/events", Map.of("name", "sharded", "stock", 10, "shards", 4), EventCreatedResponse.class);
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(created.getBody().shards()).isEqualTo(4);
+        long eventId = created.getBody().id();
+
+        reserve(eventId, "alice", newKey());
+
+        StockSnapshot stock = stock(eventId);
+        assertThat(stock.shards()).isEqualTo(4);
+        assertThat(stock.remaining()).isEqualTo(9);
+        assertThat(stock.isConsistent()).isTrue();
+    }
+
+    @Test
+    void rejectsInvalidShardCount() {
+        for (int shards : new int[]{0, 257}) {
+            ResponseEntity<ProblemDetail> response = http.postForEntity(
+                    "/events", Map.of("name", "bad", "stock", 10, "shards", shards), ProblemDetail.class);
+            assertThat(response.getStatusCode()).as("shards=%d", shards).isEqualTo(HttpStatus.BAD_REQUEST);
+        }
+    }
+
     // --- helpers -------------------------------------------------------------
 
     private long createEvent(int stock) {

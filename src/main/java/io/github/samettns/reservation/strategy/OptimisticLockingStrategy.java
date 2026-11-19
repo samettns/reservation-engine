@@ -1,5 +1,6 @@
 package io.github.samettns.reservation.strategy;
 
+import io.github.samettns.reservation.strategy.StockShards.RowResult;
 import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -20,17 +21,21 @@ import java.util.stream.IntStream;
  * <p>Caveat specific to PostgreSQL: the conditional UPDATE still takes a row lock and a
  * loser waits for the winner to commit before seeing "0 rows". So "optimistic" here means
  * "no lock between read and write", not "never waits".
+ *
+ * <p>With sharding, attempts are counted per row: running out of attempts on one shard
+ * moves on to the next shard; only if no shard works does the request fail with 503.
  */
 @Component
 public class OptimisticLockingStrategy implements ReservationStrategy {
 
-    /** Number of compare-and-set attempts per request, tagged by how the request ended. */
+    /** Number of compare-and-set attempts on a row, tagged by how that row attempt ended. */
     static final String ATTEMPTS_METRIC = "reservation.optimistic.attempts";
 
     private record VersionedStock(int qty, long version) {
     }
 
     private final JdbcClient jdbc;
+    private final StockShards shards;
     private final int maxAttempts;
     private final DistributionSummary acquiredAttempts;
     private final DistributionSummary soldOutAttempts;
@@ -38,9 +43,11 @@ public class OptimisticLockingStrategy implements ReservationStrategy {
 
     @Autowired
     public OptimisticLockingStrategy(JdbcClient jdbc,
+                                     StockShards shards,
                                      @Value("${reservation.optimistic.max-attempts:10}") int maxAttempts,
                                      MeterRegistry meters) {
         this.jdbc = jdbc;
+        this.shards = shards;
         this.maxAttempts = maxAttempts;
         this.acquiredAttempts = attemptsSummary(meters, "acquired");
         this.soldOutAttempts = attemptsSummary(meters, "sold_out");
@@ -67,32 +74,40 @@ public class OptimisticLockingStrategy implements ReservationStrategy {
 
     @Override
     public boolean tryAcquireOne(long eventId) {
+        return shards.acquire(eventId, this::tryRow);
+    }
+
+    private RowResult tryRow(long eventId, int shardNo) {
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-            VersionedStock current = jdbc.sql("SELECT qty, version FROM stock WHERE event_id = :eventId")
+            VersionedStock current = jdbc.sql("""
+                            SELECT qty, version FROM stock WHERE event_id = :eventId AND shard_no = :shardNo
+                            """)
                     .param("eventId", eventId)
+                    .param("shardNo", shardNo)
                     .query((rs, rowNum) -> new VersionedStock(rs.getInt("qty"), rs.getLong("version")))
                     .single();
             if (current.qty() <= 0) {
                 soldOutAttempts.record(attempt);
-                return false;
+                return RowResult.EMPTY;
             }
             int updated = jdbc.sql("""
                             UPDATE stock
                             SET qty = qty - 1, version = version + 1
-                            WHERE event_id = :eventId AND version = :version
+                            WHERE event_id = :eventId AND shard_no = :shardNo AND version = :version
                             """)
                     .param("eventId", eventId)
+                    .param("shardNo", shardNo)
                     .param("version", current.version())
                     .update();
             if (updated == 1) {
                 acquiredAttempts.record(attempt);
-                return true;
+                return RowResult.ACQUIRED;
             }
             // Lost the race: someone changed the row after our read. Re-read and try again.
             // No sleep/backoff on purpose: we are inside a transaction holding a DB
             // connection, so sleeping would block a pooled connection while doing nothing.
         }
         exhaustedAttempts.record(maxAttempts);
-        throw new ContentionException(eventId, maxAttempts);
+        return RowResult.CONTENDED;
     }
 }

@@ -7,7 +7,7 @@ package io.github.samettns.reservation.strategy;
  */
 public class ContentionException extends RuntimeException {
 
-    public ContentionException(long eventId, int attempts) {
-        super("Gave up on event " + eventId + " after " + attempts + " attempts due to contention");
+    public ContentionException(long eventId, String reason) {
+        super("Gave up on event " + eventId + ": " + reason);
     }
 }
