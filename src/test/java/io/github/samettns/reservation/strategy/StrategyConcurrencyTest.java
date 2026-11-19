@@ -78,25 +78,40 @@ class StrategyConcurrencyTest extends IntegrationTest {
         }
     }
 
+    /**
+     * A race condition is probabilistic: two transactions must read the stock inside the
+     * ~1 ms window before the first one commits. Measured: with stock=1 a single burst
+     * misses it roughly half the time (it failed once in a clean CI run). So the burst is
+     * repeated on a fresh event up to {@value #NAIVE_MAX_ROUNDS} times and at least one
+     * round must oversell (false failure odds ~0.5^20, about one in a million).
+     * That this is needed at all is the lesson: races slip through "it worked once" tests.
+     */
+    private static final int NAIVE_MAX_ROUNDS = 20;
+
     @ParameterizedTest(name = "naive: stock={0}, 1000 concurrent requests -> OVERSELLS")
     @ValueSource(ints = {1, 100})
     void naiveStrategyOversells(int stock) {
-        long eventId = events.create("concurrency-naive", stock);
         ReservationService service = serviceWith("naive");
 
-        Tally tally = reserveConcurrently(service, eventId, REQUESTS);
-        StockSnapshot s = invariant.snapshot(eventId);
-        System.out.printf("[naive stock=%d] %s -> reserved=%d remaining=%d%n",
-                stock, tally, s.reserved(), s.remaining());
+        StockSnapshot oversold = null;
+        for (int round = 1; round <= NAIVE_MAX_ROUNDS && oversold == null; round++) {
+            long eventId = events.create("concurrency-naive", stock);
+            Tally tally = reserveConcurrently(service, eventId, REQUESTS);
+            StockSnapshot s = invariant.snapshot(eventId);
+            System.out.printf("[naive stock=%d round=%d] %s -> reserved=%d remaining=%d%n",
+                    stock, round, tally, s.reserved(), s.remaining());
+            assertThat(tally.unexpectedErrors()).isEmpty();
 
-        assertThat(tally.unexpectedErrors()).isEmpty();
-        // Lost updates: more reservations exist than units that left the stock counter.
-        assertThat(s.reserved() + s.remaining())
-                .as("naive strategy should break conservation (lost updates)")
-                .isGreaterThan(s.totalStock());
-        if (stock == 1) {
-            assertThat(s.reserved()).as("1 ticket sold to several people").isGreaterThan(1);
+            // Lost updates: more reservations exist than units that left the stock counter.
+            if (s.reserved() + s.remaining() > s.totalStock()) {
+                oversold = s;
+            }
         }
+
+        assertThat(oversold)
+                .as("naive strategy should break conservation within %d rounds", NAIVE_MAX_ROUNDS)
+                .isNotNull();
+        assertThat(oversold.reserved()).as("more sold than exists").isGreaterThan(stock);
     }
 
     @ParameterizedTest(name = "{0}: stock={1}, 100 concurrent retries of the SAME request -> exactly one reservation")
