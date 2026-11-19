@@ -14,7 +14,8 @@ import org.springframework.context.annotation.Import;
  * the middle of an assertion. The Kafka consumer stays on.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {"reservation.expiry.enabled=false", "reservation.events.relay.enabled=false"})
+        properties = {"reservation.expiry.enabled=false", "reservation.events.relay.enabled=false",
+                "reservation.reconciler.enabled=false"})
 @Import({TestcontainersConfiguration.class, StockInvariant.class})
 public abstract class IntegrationTest {
 }

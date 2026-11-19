@@ -69,6 +69,11 @@ reservation:
     # Every instance sweeps; they split the work with FOR UPDATE SKIP LOCKED.
     interval: ${EXPIRY_INTERVAL:PT1S}
     batch-size: ${EXPIRY_BATCH_SIZE:200}
+  reconciler:
+    # Corrects Redis gate counters from the DB's remaining stock; one instance per round (Redis lock).
+    enabled: ${RECONCILER_ENABLED:true}
+    interval: ${RECONCILER_INTERVAL:PT30S}
+    lock-ttl: ${RECONCILER_LOCK_TTL:PT10S}
   events:
     # EVENTS_ENABLED=false turns off the relay and the consumer (outbox rows are still written).
     relay:
