@@ -150,7 +150,9 @@ def start_strategy(strategy):
     # Kafka is not running during benchmarks: relay and consumer off (outbox rows are still written,
     # so their cost inside the reservation transaction IS measured).
     sh("docker", "compose", "--profile", "bench", "up", "-d", "--wait", "--force-recreate",
-       *APPS, "nginx", env={"RESERVATION_STRATEGY": strategy, "EVENTS_ENABLED": "false"})
+       *APPS, "nginx", env={"RESERVATION_STRATEGY": strategy, "EVENTS_ENABLED": "false",
+                            # the reconciler would rewrite Redis counters in the middle of a run
+                            "RECONCILER_ENABLED": "false"})
     for base in INSTANCES:
         health = http_json("GET", f"{base}/actuator/health")
         assert health["status"] == "UP", health

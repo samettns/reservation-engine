@@ -21,6 +21,8 @@ x-app: &app
     KAFKA_BOOTSTRAP_SERVERS: kafka:19092
     # Benchmarks run without Kafka and set this to false (relay + consumer off; outbox rows are still written).
     EVENTS_ENABLED: ${EVENTS_ENABLED:-true}
+    RECONCILER_ENABLED: ${RECONCILER_ENABLED:-true}
+    RECONCILER_INTERVAL: ${RECONCILER_INTERVAL:-PT30S}
   depends_on:
     postgres:
       condition: service_healthy
