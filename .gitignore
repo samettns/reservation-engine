@@ -17,6 +17,5 @@ Thumbs.db
 # Personal study notes (kept local, never committed)
 notes/
 
-# Benchmark outputs (generated)
-bench/results/*.csv
-bench/results/*.json
+# Benchmark scratch output (generated). The published run is copied to docs/benchmarks/.
+bench/results/
