@@ -17,6 +17,8 @@ public interface ReservationStrategy {
      * Tries to take one unit of stock.
      *
      * @return {@code true} if a unit was taken, {@code false} if the event is sold out
+     * @throws ContentionException if the strategy gave up because of too much contention;
+     *                             stock may still be available and the client may retry
      */
     boolean tryAcquireOne(long eventId);
 }
