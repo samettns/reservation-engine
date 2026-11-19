@@ -56,7 +56,7 @@ class IdempotencyAndSoldOutTest extends IntegrationTest {
     @Test
     void liveClaimOfTheSameRequestAnswersInProgressWithoutTouchingStock() {
         long eventId = events.create("in-progress", 5);
-        assertThat(idempotency.claim("alice", "k-" + eventId, eventId, LEASE)).isTrue(); // a twin is "working"
+        assertThat(idempotency.claim("alice", "k-" + eventId, eventId, LEASE)).isPresent(); // a twin is "working"
 
         ReservationOutcome outcome = service("atomic").reserve(eventId, "alice", "k-" + eventId);
 
@@ -67,7 +67,7 @@ class IdempotencyAndSoldOutTest extends IntegrationTest {
     @Test
     void abandonedClaimOfACrashedRequestIsTakenOver() {
         long eventId = events.create("abandoned", 5);
-        assertThat(idempotency.claim("alice", "k-" + eventId, eventId, Duration.ofSeconds(-1))).isTrue(); // lease already over
+        assertThat(idempotency.claim("alice", "k-" + eventId, eventId, Duration.ofSeconds(-1))).isPresent(); // lease already over
 
         ReservationOutcome outcome = service("atomic").reserve(eventId, "alice", "k-" + eventId);
 

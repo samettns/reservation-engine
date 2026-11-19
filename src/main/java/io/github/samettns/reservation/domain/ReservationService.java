@@ -18,6 +18,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.time.Duration;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.OptionalLong;
 import java.util.UUID;
 
 @Service
@@ -37,6 +38,8 @@ public class ReservationService {
     private final Duration idempotencyLease;
     private final Counter redisShortcut;
     private final Counter markerShortcut;
+    /** Test-only pause point between claiming the key and starting the transaction (simulates a GC pause). */
+    private final Runnable afterClaim;
 
     @Autowired
     public ReservationService(ReservationStrategy strategy,
@@ -48,6 +51,14 @@ public class ReservationService {
                               @Value("${reservation.hold-ttl:PT10M}") Duration holdTtl,
                               @Value("${reservation.idempotency.lease:PT30S}") Duration idempotencyLease,
                               MeterRegistry meters) {
+        this(strategy, reservations, events, outbox, idempotency, tx, holdTtl, idempotencyLease, meters, () -> { });
+    }
+
+    /** Package-private: only tests in this package can inject a pause; production always gets a no-op. */
+    ReservationService(ReservationStrategy strategy, ReservationRepository reservations, EventRepository events,
+                       ReservationEvents outbox, IdempotencyRepository idempotency, TransactionTemplate tx,
+                       Duration holdTtl, Duration idempotencyLease, MeterRegistry meters, Runnable afterClaim) {
+        this.afterClaim = afterClaim;
         this.strategy = strategy;
         this.reservations = reservations;
         this.events = events;
@@ -92,15 +103,24 @@ public class ReservationService {
             return answerWithoutTouchingStock(eventId, userId, idempotencyKey);
         }
 
-        if (!idempotency.claim(userId, idempotencyKey, eventId, idempotencyLease)) {
+        OptionalLong claim = idempotency.claim(userId, idempotencyKey, eventId, idempotencyLease);
+        if (claim.isEmpty()) {
             return existingOutcome(eventId, userId, idempotencyKey)
                     // the owner released the key a moment ago (no side effect); retrying is safe
                     .orElse(new ReservationOutcome.InProgress(eventId));
         }
+        long fenceToken = claim.getAsLong();
+        afterClaim.run();
 
         boolean created = false;
         try {
             ReservationOutcome outcome = tx.execute(status -> {
+                // Fencing, step 1: still the owner? Also locks the claim row for this transaction, so
+                // the key cannot be taken over while we work. A slow owner whose lease was taken over
+                // stops HERE, before touching any stock.
+                if (!idempotency.lockClaim(userId, idempotencyKey, fenceToken)) {
+                    throw new StaleClaimException(idempotencyKey, fenceToken);
+                }
                 OptionalInt shard = strategy.tryAcquireOne(eventId);
                 if (shard.isEmpty()) {
                     // Every shard was empty: remember it, as of the stock version read above.
@@ -109,21 +129,28 @@ public class ReservationService {
                 }
                 Reservation hold = reservations.insertHeld(eventId, shard.getAsInt(), userId, idempotencyKey, holdTtl);
                 outbox.held(hold);
-                idempotency.complete(userId, idempotencyKey, hold.id());
+                // Fencing, step 2 (defence in depth): COMPLETED only with the current token.
+                if (!idempotency.complete(userId, idempotencyKey, hold.id(), fenceToken)) {
+                    throw new StaleClaimException(idempotencyKey, fenceToken); // rolls back hold + stock
+                }
                 return new ReservationOutcome.Created(hold);
             });
             created = outcome instanceof ReservationOutcome.Created;
             return outcome;
+        } catch (StaleClaimException stale) {
+            // Our lease was taken over while we were slow; everything we did was rolled back.
+            // Answer with the new owner's state.
+            return existingOutcome(eventId, userId, idempotencyKey).orElse(new ReservationOutcome.InProgress(eventId));
         } catch (DuplicateKeyException concurrentDuplicate) {
-            // Safety net below the claim: if a lease expired while its owner was still working, two
-            // requests can hold the claim. The unique (user, key) constraint on reservations still
-            // lets only one insert win; ours rolled back (stock included). Return the winner's result.
+            // Last safety net: the unique (user, key) constraint on reservations. With fencing this
+            // should not be reachable, but if it is, only one insert wins and ours rolled back.
             return reservations.findByIdempotencyKey(userId, idempotencyKey)
                     .<ReservationOutcome>map(ReservationOutcome.Replayed::new)
                     .orElseThrow(() -> concurrentDuplicate);
         } finally {
             if (!created) {
-                idempotency.release(userId, idempotencyKey); // no-op if a winner COMPLETED it
+                // Fencing, step 3: only the CURRENT owner can release; a stale token deletes nothing.
+                idempotency.release(userId, idempotencyKey, fenceToken);
             }
         }
     }
