@@ -1,8 +1,13 @@
 package io.github.samettns.reservation.strategy;
 
+import io.micrometer.core.instrument.DistributionSummary;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
+
+import java.util.stream.IntStream;
 
 /**
  * Read the row with its version, then write only if the version is unchanged
@@ -19,16 +24,40 @@ import org.springframework.stereotype.Component;
 @Component
 public class OptimisticLockingStrategy implements ReservationStrategy {
 
+    /** Number of compare-and-set attempts per request, tagged by how the request ended. */
+    static final String ATTEMPTS_METRIC = "reservation.optimistic.attempts";
+
     private record VersionedStock(int qty, long version) {
     }
 
     private final JdbcClient jdbc;
     private final int maxAttempts;
+    private final DistributionSummary acquiredAttempts;
+    private final DistributionSummary soldOutAttempts;
+    private final DistributionSummary exhaustedAttempts;
 
+    @Autowired
     public OptimisticLockingStrategy(JdbcClient jdbc,
-                                     @Value("${reservation.optimistic.max-attempts:10}") int maxAttempts) {
+                                     @Value("${reservation.optimistic.max-attempts:10}") int maxAttempts,
+                                     MeterRegistry meters) {
         this.jdbc = jdbc;
         this.maxAttempts = maxAttempts;
+        this.acquiredAttempts = attemptsSummary(meters, "acquired");
+        this.soldOutAttempts = attemptsSummary(meters, "sold_out");
+        this.exhaustedAttempts = attemptsSummary(meters, "exhausted");
+    }
+
+    /**
+     * One histogram bucket per attempt count (1, 2, ... max). Attempts are small integers,
+     * so cumulative bucket counts give the exact distribution, and the benchmark can diff
+     * them before/after a run to get that run's average and maximum.
+     */
+    private DistributionSummary attemptsSummary(MeterRegistry meters, String outcome) {
+        double[] buckets = IntStream.rangeClosed(1, maxAttempts).asDoubleStream().toArray();
+        return DistributionSummary.builder(ATTEMPTS_METRIC)
+                .tag("outcome", outcome)
+                .serviceLevelObjectives(buckets)
+                .register(meters);
     }
 
     @Override
@@ -44,6 +73,7 @@ public class OptimisticLockingStrategy implements ReservationStrategy {
                     .query((rs, rowNum) -> new VersionedStock(rs.getInt("qty"), rs.getLong("version")))
                     .single();
             if (current.qty() <= 0) {
+                soldOutAttempts.record(attempt);
                 return false;
             }
             int updated = jdbc.sql("""
@@ -55,12 +85,14 @@ public class OptimisticLockingStrategy implements ReservationStrategy {
                     .param("version", current.version())
                     .update();
             if (updated == 1) {
+                acquiredAttempts.record(attempt);
                 return true;
             }
             // Lost the race: someone changed the row after our read. Re-read and try again.
             // No sleep/backoff on purpose: we are inside a transaction holding a DB
             // connection, so sleeping would block a pooled connection while doing nothing.
         }
+        exhaustedAttempts.record(maxAttempts);
         throw new ContentionException(eventId, maxAttempts);
     }
 }

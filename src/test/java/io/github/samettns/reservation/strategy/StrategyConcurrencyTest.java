@@ -9,6 +9,8 @@ import io.github.samettns.reservation.infra.ReservationRepository;
 import io.github.samettns.reservation.support.ConcurrentRunner;
 import io.github.samettns.reservation.support.ConcurrentRunner.Attempt;
 import io.github.samettns.reservation.support.StockInvariant;
+import io.micrometer.core.instrument.DistributionSummary;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -159,18 +161,44 @@ class StrategyConcurrencyTest extends IntegrationTest {
     void optimisticStrategyGivesUpWithContentionExceptionWhenAttemptsRunOut() {
         long eventId = events.create("optimistic-exhaustion", 1_000);
         // One attempt only: anyone who loses the first race must give up.
-        var oneShot = new OptimisticLockingStrategy(jdbc, 1);
+        var meters = new SimpleMeterRegistry();
+        var oneShot = new OptimisticLockingStrategy(jdbc, 1, meters);
         ReservationService service = new ReservationService(oneShot, reservations, events, tx);
 
         Tally tally = reserveConcurrently(service, eventId, 200);
         System.out.printf("[optimistic max-attempts=1] %s%n", tally);
 
         assertThat(tally.unexpectedErrors()).isEmpty();
+        // The benchmark relies on these metrics: they must match what clients saw.
+        assertThat(attempts(meters, "acquired").count()).isEqualTo(tally.created());
+        assertThat(attempts(meters, "exhausted").count()).isEqualTo(tally.contended());
         assertThat(tally.contended()).as("some requests should lose the race and give up").isPositive();
         invariant.assertHolds(eventId, tally.created());
     }
 
+    @Test
+    void optimisticAttemptsMetricCountsRetries() {
+        long eventId = events.create("optimistic-metrics", 1_000_000);
+        var meters = new SimpleMeterRegistry();
+        var strategy = new OptimisticLockingStrategy(jdbc, 10, meters);
+        ReservationService service = new ReservationService(strategy, reservations, events, tx);
+
+        Tally tally = reserveConcurrently(service, eventId, 500);
+        DistributionSummary acquired = attempts(meters, "acquired");
+        System.out.printf("[optimistic metrics] %s avgAttempts=%.2f maxAttempts=%.0f%n",
+                tally, acquired.mean(), acquired.max());
+
+        assertThat(acquired.count() + attempts(meters, "exhausted").count())
+                .isEqualTo(tally.created() + tally.contended());
+        assertThat(acquired.mean()).as("contention should force some retries").isGreaterThan(1.0);
+        assertThat(acquired.max()).isBetween(2.0, 10.0);
+    }
+
     // --- helpers -------------------------------------------------------------
+
+    private static DistributionSummary attempts(SimpleMeterRegistry meters, String outcome) {
+        return meters.get(OptimisticLockingStrategy.ATTEMPTS_METRIC).tag("outcome", outcome).summary();
+    }
 
     /**
      * {@code count} different users, each with its own key. Keys include the event id
