@@ -24,24 +24,29 @@ THEMES = {
     "light": {
         "surface": "#fcfcfb", "ink": "#0b0b0b", "ink2": "#52514e", "muted": "#898781",
         "grid": "#e1e0d9", "axis": "#c3c2b7", "reference": "#898781",
-        "series": {"atomic": "#2a78d6", "optimistic": "#eb6834", "pessimistic": "#1baf7a", "redis": "#eda100"},
+        "series": {"atomic": "#2a78d6", "optimistic": "#eb6834", "pessimistic": "#1baf7a", "redis": "#eda100",
+                   # violet, not magenta: magenta next to aqua (pessimistic) fails the CVD check in dark mode
+                   "pessimistic-precheck": "#6250d6"},
     },
     "dark": {
         "surface": "#1a1a19", "ink": "#f0efec", "ink2": "#c3c2b7", "muted": "#898781",
         "grid": "#2c2c2a", "axis": "#383835", "reference": "#898781",
-        "series": {"atomic": "#3987e5", "optimistic": "#d95926", "pessimistic": "#199e70", "redis": "#c98500"},
+        "series": {"atomic": "#3987e5", "optimistic": "#d95926", "pessimistic": "#199e70", "redis": "#c98500",
+                   "pessimistic-precheck": "#9085e9"},
     },
 }
 
-ORDER = ["atomic", "optimistic", "pessimistic", "redis", "naive"]
+ORDER = ["atomic", "optimistic", "pessimistic", "pessimistic-precheck", "redis", "naive"]
 LABELS = {
     "atomic": "atomic",
     "optimistic": "optimistic",
     "pessimistic": "pessimistic",
+    "pessimistic-precheck": "pessimistic + pre-check",
     "redis": "redis (+ PostgreSQL)",
     "naive": "naive (wrong: oversells)",
 }
-MARKERS = {"atomic": "o", "optimistic": "s", "pessimistic": "^", "redis": "D", "naive": "x"}
+MARKERS = {"atomic": "o", "optimistic": "s", "pessimistic": "^", "pessimistic-precheck": "v",
+           "redis": "D", "naive": "x"}
 
 
 def load():

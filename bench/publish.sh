@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Copies the latest benchmark run (CSV, summary, charts) to docs/benchmarks/ for the README.
+# Copies a benchmark run (CSV, summary, charts) to docs/benchmarks/ for the README.
+#   bash bench/publish.sh                              # bench/results          -> docs/benchmarks/
+#   bash bench/publish.sh results-sharding sharding    # bench/results-sharding -> docs/benchmarks/sharding/
 set -euo pipefail
 cd "$(dirname "$0")/.."
-mkdir -p docs/benchmarks
-cp bench/results/results.csv bench/results/summary.md docs/benchmarks/
-cp bench/results/*.png docs/benchmarks/
-echo "published to docs/benchmarks/:"
-ls docs/benchmarks
+SRC=bench/${1:-results}
+DEST=docs/benchmarks${2:+/$2}
+mkdir -p "$DEST"
+cp "$SRC/results.csv" "$SRC/summary.md" "$DEST/"
+cp "$SRC"/*.png "$DEST/"
+echo "published $SRC -> $DEST:"
+ls "$DEST"

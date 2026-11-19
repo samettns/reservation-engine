@@ -19,3 +19,4 @@ notes/
 
 # Benchmark scratch output (generated). The published run is copied to docs/benchmarks/.
 bench/results/
+bench/results-*/

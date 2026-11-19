@@ -18,6 +18,8 @@ Only the Python standard library is used. Configure with environment variables:
   BENCH_STRATEGIES  (default naive,atomic,optimistic,pessimistic,redis)
   BENCH_VUS         (default 10,100,1000,5000)
   BENCH_MODES       (default contention,sellout)
+  BENCH_SHARDS      stock shards per event (default 1)
+  BENCH_OUT         output directory relative to the repo (default bench/results)
   BENCH_DURATION    contention run length (default 20s)
   BENCH_WARMUP      warm-up length per strategy (default 10s)
   SELLOUT_STOCK     (default 1000)     SELLOUT_REQUESTS (default 20000)
@@ -29,12 +31,13 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-RESULTS = ROOT / "bench" / "results"
+RESULTS = ROOT / os.environ.get("BENCH_OUT", "bench/results")
 RAW = RESULTS / "raw"
 CSV_PATH = RESULTS / "results.csv"
 
@@ -47,6 +50,7 @@ APPS = ["app1", "app2", "app3"]
 STRATEGIES = os.environ.get("BENCH_STRATEGIES", "naive,atomic,optimistic,pessimistic,redis").split(",")
 VUS_LEVELS = [int(v) for v in os.environ.get("BENCH_VUS", "10,100,1000,5000").split(",")]
 MODES = os.environ.get("BENCH_MODES", "contention,sellout").split(",")
+SHARDS = [int(s) for s in os.environ.get("BENCH_SHARDS", "1").split(",")]
 DURATION = os.environ.get("BENCH_DURATION", "20s")
 WARMUP = os.environ.get("BENCH_WARMUP", "10s")
 SELLOUT_STOCK = int(os.environ.get("SELLOUT_STOCK", "1000"))
@@ -63,13 +67,60 @@ K6_DOCKER = [
 ]
 
 FIELDS = [
-    "strategy", "mode", "vus", "duration_s", "requests", "rps", "reserved_per_s",
+    "strategy", "mode", "shards", "vus", "duration_s", "requests", "rps", "reserved_per_s",
     "status_201", "status_409", "status_503", "status_other", "rate_503",
     "p50_ms", "p95_ms", "p99_ms", "max_ms",
     "avg_retries", "max_retries",
     "hikari_acquire_avg_ms", "hikari_timeouts",
+    "db_active_avg", "db_lock_wait_pct", "db_io_wait_pct", "db_lwlock_wait_pct",
     "total_stock", "db_reserved", "db_remaining", "oversold", "k6_201_equals_db",
+    "unsold_after_sellout", "shards_touched",
 ]
+
+
+class DbWaitSampler(threading.Thread):
+    """
+    Samples pg_stat_activity once per second while k6 runs: how many backends are active,
+    and what share of them is waiting on a lock (row lock queue = hot row) or on I/O (WAL
+    flush on commit). This is direct evidence of WHERE time goes, not an inference.
+    """
+
+    # Lock   = heavyweight locks, e.g. waiting for another transaction's row lock (hot row queue)
+    # IO     = waiting for disk, e.g. WALSync when a commit flushes the write-ahead log
+    # LWLock = short internal locks, e.g. WALWrite while queueing to write the WAL at commit
+    QUERY = ("SELECT count(*), "
+             "count(*) FILTER (WHERE wait_event_type = 'Lock'), "
+             "count(*) FILTER (WHERE wait_event_type = 'IO'), "
+             "count(*) FILTER (WHERE wait_event_type = 'LWLock') "
+             "FROM pg_stat_activity WHERE datname = 'reservation' AND state = 'active' "
+             "AND pid <> pg_backend_pid()")
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.samples = []
+        self._halt = threading.Event()  # not "_stop": threading.Thread already has a _stop() method
+
+    def run(self):
+        while not self._halt.wait(1.0):
+            out = sh("docker", "compose", "exec", "-T", "postgres", "psql", "-U", "reservation",
+                     "-d", "reservation", "-t", "-A", "-F", ",", "-c", self.QUERY, check=False).stdout
+            try:
+                sample = tuple(int(x) for x in out.strip().split(","))
+            except ValueError:
+                continue
+            if len(sample) == 4 and sample[0]:
+                self.samples.append(sample)
+
+    def stop(self):
+        """Returns (avg active sessions, % waiting on Lock, % on IO, % on LWLock); blanks if no sample."""
+        self._halt.set()
+        self.join()
+        if not self.samples:
+            return "", "", "", ""
+        n = len(self.samples)
+        active = sum(s[0] for s in self.samples)
+        return (round(active / n, 1),
+                *(round(100 * sum(s[i] for s in self.samples) / active, 1) for i in (1, 2, 3)))
 
 
 # --- helpers -----------------------------------------------------------------
@@ -109,8 +160,20 @@ def reset_state():
     sh("docker", "compose", "exec", "-T", "redis", "redis-cli", "FLUSHALL")
 
 
-def create_event(stock):
-    return http_json("POST", f"{NGINX}/events", {"name": "bench", "stock": stock})["id"]
+def psql_value(sql):
+    out = sh("docker", "compose", "exec", "-T", "postgres", "psql", "-U", "reservation", "-d", "reservation",
+             "-t", "-A", "-c", sql).stdout.strip()
+    return int(out)
+
+
+def shards_touched(event_id):
+    """How many stock shards were actually drawn from (each started at total_stock / shard_count)."""
+    return psql_value(f"SELECT count(*) FROM stock s JOIN events e ON e.id = s.event_id "
+                      f"WHERE e.id = {int(event_id)} AND s.qty < e.total_stock / e.shard_count")
+
+
+def create_event(stock, shards=1):
+    return http_json("POST", f"{NGINX}/events", {"name": "bench", "stock": stock, "shards": shards})["id"]
 
 
 # --- server metrics ------------------------------------------------------------
@@ -186,27 +249,40 @@ def warm_up(strategy):
        "-e", "SUMMARY_FILE=/results/raw/warmup.json", "/scripts/reserve.js")
 
 
-def run_one(strategy, mode, vus):
+def run_one(strategy, mode, shards, vus):
     reset_state()
     stock = SELLOUT_STOCK if mode == "sellout" else CONTENTION_STOCK
-    event_id = create_event(stock)
-    run_id = f"{strategy}-{mode}-{vus}"
+    event_id = create_event(stock, shards)
+    run_id = f"{strategy}-{mode}-s{shards}-{vus}"
 
     before = scrape()
+    sampler = DbWaitSampler()
+    sampler.start()
     summary = run_k6(mode, vus, event_id, run_id, f"{run_id}.json")
+    db_active, lock_pct, io_pct, lwlock_pct = sampler.stop()
     after = scrape()
     snapshot = http_json("GET", f"{NGINX}/events/{event_id}/stock")
+    touched = shards_touched(event_id)
 
     duration_s = summary["state"]["testRunDurationMs"] / 1000
     s201, s409 = metric(summary, "status_201"), metric(summary, "status_409")
     s503, other = metric(summary, "status_503"), metric(summary, "status_other")
     requests = s201 + s409 + s503 + other
+
+    # Sanity checks on the benchmark itself (the invariant alone does not catch "undersell"):
+    # a sellout with more requests than stock must end with nothing left, and a sharded run
+    # must actually have drawn from its shards.
+    unsold = snapshot["remaining"] if mode == "sellout" and requests > stock else ""
+    if unsold:
+        log(f"!! {run_id}: {unsold} units unsold although {int(s409)} requests were told 'sold out'")
+    if mode == "contention" and touched < min(shards, vus):
+        log(f"!! {run_id}: only {touched} of {shards} shards were used")
     avg_retries, max_retries = retry_stats(before, after)
     acquire_ms, timeouts = hikari_stats(before, after)
     latency = summary["metrics"]["http_req_duration"]["values"]
 
     return {
-        "strategy": strategy, "mode": mode, "vus": vus,
+        "strategy": strategy, "mode": mode, "shards": shards, "vus": vus,
         "duration_s": round(duration_s, 2), "requests": int(requests),
         "rps": round(requests / duration_s, 1), "reserved_per_s": round(s201 / duration_s, 1),
         "status_201": int(s201), "status_409": int(s409), "status_503": int(s503), "status_other": int(other),
@@ -215,17 +291,20 @@ def run_one(strategy, mode, vus):
         "p99_ms": round(latency["p(99)"], 2), "max_ms": round(latency["max"], 2),
         "avg_retries": avg_retries, "max_retries": max_retries,
         "hikari_acquire_avg_ms": acquire_ms, "hikari_timeouts": timeouts,
+        "db_active_avg": db_active, "db_lock_wait_pct": lock_pct, "db_io_wait_pct": io_pct,
+        "db_lwlock_wait_pct": lwlock_pct,
         "total_stock": snapshot["totalStock"], "db_reserved": snapshot["reserved"],
         "db_remaining": snapshot["remaining"],
         # > 0 means more reservations exist than units that left the stock counter.
         "oversold": snapshot["reserved"] + snapshot["remaining"] - snapshot["totalStock"],
         "k6_201_equals_db": int(s201) == snapshot["reserved"],
+        "unsold_after_sellout": unsold, "shards_touched": touched,
     }
 
 
 def main():
     RAW.mkdir(parents=True, exist_ok=True)
-    log(f"strategies={STRATEGIES} modes={MODES} vus={VUS_LEVELS} duration={DURATION}")
+    log(f"strategies={STRATEGIES} modes={MODES} shards={SHARDS} vus={VUS_LEVELS} duration={DURATION}")
     with open(CSV_PATH, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDS)
         writer.writeheader()
@@ -233,15 +312,18 @@ def main():
             start_strategy(strategy)
             warm_up(strategy)
             for mode in MODES:
-                for vus in VUS_LEVELS:
-                    row = run_one(strategy, mode, vus)
-                    writer.writerow(row)
-                    f.flush()
-                    log(f"{strategy:<11} {mode:<10} vus={vus:<5} rps={row['rps']:<8} "
-                        f"reserved/s={row['reserved_per_s']:<8} p99={row['p99_ms']}ms "
-                        f"503={row['status_503']} other={row['status_other']} "
-                        f"retries(avg/max)={row['avg_retries']}/{row['max_retries']} "
-                        f"acquire={row['hikari_acquire_avg_ms']}ms oversold={row['oversold']}")
+                for shards in SHARDS:
+                    for vus in VUS_LEVELS:
+                        row = run_one(strategy, mode, shards, vus)
+                        writer.writerow(row)
+                        f.flush()
+                        log(f"{strategy:<20} {mode:<10} shards={shards:<3} vus={vus:<5} rps={row['rps']:<8} "
+                            f"reserved/s={row['reserved_per_s']:<8} p99={row['p99_ms']}ms "
+                            f"503={row['status_503']} other={row['status_other']} "
+                            f"retries={row['avg_retries']}/{row['max_retries']} "
+                            f"lock%={row['db_lock_wait_pct']} io%={row['db_io_wait_pct']} "
+                            f"lwlock%={row['db_lwlock_wait_pct']} active={row['db_active_avg']} "
+                            f"oversold={row['oversold']}")
     log(f"done -> {CSV_PATH}")
 
 
