@@ -40,6 +40,19 @@ curl localhost:8080/events/1/stock
 | `Idempotency-Key` eksik / geçersiz gövde | `400 Bad Request` |
 | Çekişme yüzünden vazgeçildi (optimistic, deneme hakkı bitti) | `503 Service Unavailable` + `Retry-After` |
 
+Rezervasyon önce **`HELD`** olarak oluşur ve `expiresAt`'e kadar (varsayılan 10 dk, `HOLD_TTL`) ödeme bekler:
+
+```bash
+curl -X POST localhost:8080/reservations/{reservationId}/confirm   # ödeme callback'i
+```
+
+| Ödeme onayı | HTTP |
+|---|---|
+| Süre dolmadan onaylandı | `200 OK` (`CONFIRMED`) |
+| Tekrarlanan callback | `200 OK` + `Idempotent-Replayed: true` |
+| Süre dolduktan sonra geldi | `410 Gone` |
+| Rezervasyon yok | `404 Not Found` |
+
 ## Stratejiler
 
 `RESERVATION_STRATEGY` ortam değişkeniyle seçilir (varsayılan `atomic`):
@@ -190,11 +203,41 @@ Komut: `bash bench/run-sharding.sh`. Tam tablo: [`docs/benchmarks/sharding/summa
   denildi. Önbellek kaldırıldı. Benchmark artık her koşudan sonra "satılmamış stok kaldı mı?" ve "bütün
   shard'lar kullanıldı mı?" diye kendini de kontrol ediyor.
 
+## Geçici rezervasyon ve süre dolumu (Aşama 4)
+
+```
+HELD --(ödeme, süre dolmadan)--> CONFIRMED
+HELD --(süre doldu, sweeper)----> EXPIRED   (birim, alındığı shard'a geri döner)
+```
+
+- **İki geçiş de koşullu:** `UPDATE ... WHERE status = 'HELD'`. Ödeme ile süre dolumu aynı anda olursa satır
+  kilidi altında yalnızca biri kazanır; kaybeden 0 satır günceller.
+- **Tek saat:** Son tarih de, karşılaştırmalar da PostgreSQL'in `now()`'ı ile yapılıyor; instance'ların JVM
+  saatleri arasındaki kayma sonucu etkilemiyor.
+- **Sweeper her instance'ta çalışıyor**, lider seçimi yok. Süresi dolan satırlar `FOR UPDATE SKIP LOCKED` ile
+  alınıyor: instance'lar birbirini beklemiyor ve aynı satırı iki kez almıyor. EXPIRED işaretlemesi ile stok
+  iadesi aynı transaction'da. Stok satırları sabit sırayla `(event_id, shard_no)` güncelleniyor; iki sweeper
+  birbirini kilitleyemiyor.
+- **Invariant:** `held + confirmed + kalan = toplam`.
+
+**Kanıtlar:**
+- Deterministik yarış testleri iki kazanma sırasını da sınıyor:
+  - **Süre dolumu önce kilitler:** Ödeme, kilidi bekler ve sonunda 0 satır günceller.
+  - **Ödeme önce kilitler:** Sweeper kilitli satırı beklemeden atlar.
+- Stres testinde 300 ödeme rastgele zamanlarda son tarih etrafında geldi (151 kazandı, 149 geç kaldı). Her
+  yanıt, son durumla birebir uyuştu.
+- Mutasyon testleri: `SKIP LOCKED`'ı ya da durum koşullarını kaldırınca testler kırmızıya dönüyor. İki koruma
+  birden kaldırılınca 3.000 rezervasyonun 250'si iki kez sona erdirildi.
+- **Canlı, 3 süreçle** (`bash bench/verify-expiry-live.sh`): 3 container, hiç ödenmeyen 3.000 rezervasyon,
+  3 sn TTL. Hepsi tam bir kez sona erdi (instance başına 1.054 / 607 / 1.339) ve her shard yeniden 750 birime
+  döndü.
+
 ## Bilinen sınırlamalar
 
 | Sınırlama | Etki | Çözüm planı |
 |---|---|---|
 | **Redis stratejisinde eşzamanlı idempotent tekrarlar.** Aynı `Idempotency-Key` ile gelen kopyalar, ilk istek henüz commit edilmemişken Redis sayacını geçici olarak 0 görüp `409` alabilir. | Stok doğru kalır (overselling yok), ama başarılı olmuş bir isteğin kopyasına "tükendi" denir. Ölçüm: stok 1'de 100 eşzamanlı kopyadan ~8'i. DB stratejileri etkilenmez. | Aşama 5: istek işlenirken idempotency kaydını "işlemde" olarak tutmak. |
 | **Sharding'de "tükendi" yanıtı bütün shard'ları geziyor.** | 16 shard'da flaş satış %22–47 yavaşlıyor. | Aşama 5: "tükendi" kısayolu / işareti (Redis kısayoluyla birlikte). |
+| **İade edilen stok ile "tükendi" işareti.** Süresi dolan rezervasyonlar stoğu geri getiriyor. | Aşama 5'te eklenecek "tükendi" işareti ve Redis kısayolu, stok iade edildiğinde temizlenmezse geri gelen birimler bir daha satılamaz. | Aşama 5 tasarımının parçası (iade = işareti temizle). |
 | **Shard sayısı etkinlik oluşturulurken sabitleniyor.** | Yayındaki bir etkinliğin shard sayısı değiştirilemez (resharding yok). | Kapsam dışı. |
 | **Redis düşüşü ile DB sonucu arasında çökme.** Redis'ten birim düşüldükten sonra, DB transaction'ı sonuçlanıp telafi (`INCR`) çalışmadan uygulama çökerse, düşülen birim Redis'e hiç iade edilmez. | Redis sayacı DB'den düşük kalır: o birimler satılamaz (undersell). Overselling'e yol açmaz, çünkü son kararı DB veriyor. | Aşama 7: Redis sayacını DB'deki kalan stokla eşitleyen bir mutabakat (reconciliation) işi. |
