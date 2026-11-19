@@ -59,6 +59,9 @@ Kurulum: nginx arkasında 3 uygulama instance'ı, PostgreSQL 17, Redis 7.4, yük
 Hepsi **tek bir laptopta** (16 thread, WSL2) çalışıyor; sayılar mutlak değil, stratejiler arası **göreli**
 karşılaştırma için. Tam tablo: [`docs/benchmarks/summary.md`](docs/benchmarks/summary.md).
 
+> ⚠️ **Ön sonuç.** Bu bölümdeki tüm sayılar **tek koşuya** dayanıyor. Final benchmark'ta (Aşama 8) ana
+> konfigürasyonlar 3'er kez koşturulup ortalama ± standart sapma ile güncellenecek.
+
 > **`redis` sonuçları "saf Redis" değil, "Redis + PostgreSQL"dir.** Redis yalnızca bir kapı; kapıdan geçen her
 > istek PostgreSQL'de atomik UPDATE ve commit yapıyor, idempotency kontrolü de her istekte PostgreSQL'e gidiyor.
 
@@ -96,6 +99,11 @@ karşılaştırma için. Tam tablo: [`docs/benchmarks/summary.md`](docs/benchmar
   <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/contention-failures-dark.png">
   <img alt="Contention: failed requests" src="docs/benchmarks/contention-failures.png">
 </picture>
+
+> **5.000 kullanıcı sütununu kapasite ölçümü olarak okumayın.** Bu seviyede tüm sonuçlar (throughput, p99,
+> stratejiler arası sıralama) bağlantı havuzu zaman aşımlarından etkileniyor. Gösterdikleri şey sistemin
+> gerçek kapasitesi değil, **aşırı yükteki hata davranışı**. Stratejileri karşılaştırmak için 10–1.000
+> kullanıcı sütunlarını kullanın.
 
 - Kapasitenin çok üstünde yükte isteklerin **%52–66'sı başarısız oluyor (HTTP 500).** Nedeni, bağlantı
   havuzu bekleme süresinin (5 sn) dolması: ortalama bağlantı bekleme süresi 2,3–2,9 sn. Başarılı throughput da

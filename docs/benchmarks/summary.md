@@ -1,5 +1,11 @@
 # Benchmark results
 
+> ⚠️ **Preliminary: single run per cell.** The final benchmark (stage 8) repeats the main
+> configurations 3 times and reports mean ± standard deviation.
+>
+> **The 5,000-VU rows show failure behaviour, not capacity:** they are dominated by DB connection
+> pool timeouts (HTTP 500). Compare strategies on the 10-1,000 VU rows.
+
 > **`redis` = Redis + PostgreSQL.** The Redis strategy is a Lua gate in front of the same atomic
 > PostgreSQL UPDATE; every admitted request still commits to PostgreSQL, and every request still
 > does the idempotency lookup in PostgreSQL. These are not 'pure Redis' numbers.
