@@ -120,6 +120,17 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
     }
 
     /**
+     * Redis "sold out" shortcut: the gate counter is at 0. One Redis GET, no database access.
+     * Becomes false again by itself when expired holds return units ({@link #onStockReturned}).
+     * A missing counter is not "sold out" (it is initialised from the DB on the normal path).
+     */
+    @Override
+    public boolean knownSoldOut(long eventId) {
+        String value = redis.opsForValue().get(stockKey(eventId));
+        return value != null && Long.parseLong(value) <= 0;
+    }
+
+    /**
      * An expired hold gave units back to the DB: give them back to the gate too, otherwise Redis
      * keeps saying "sold out" while the DB has stock again. Applied only AFTER the DB commit (if
      * the return rolls back, Redis must not change). If the process dies between the commit and

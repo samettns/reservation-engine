@@ -25,6 +25,8 @@ class ReservationApiTest extends IntegrationTest {
     TestRestTemplate http;
     @Autowired
     JdbcClient jdbc;
+    @Autowired
+    io.github.samettns.reservation.infra.IdempotencyRepository idempotency;
 
     @Test
     void reservesUntilSoldOut() {
@@ -140,6 +142,25 @@ class ReservationApiTest extends IntegrationTest {
                     "/events", Map.of("name", "bad", "stock", 10, "shards", shards), ProblemDetail.class);
             assertThat(response.getStatusCode()).as("shards=%d", shards).isEqualTo(HttpStatus.BAD_REQUEST);
         }
+    }
+
+    @Test
+    void concurrentRequestWithTheSameKeyGets409InProgressNotSoldOut() {
+        long eventId = createEvent(5);
+        String key = newKey();
+        idempotency.claim("alice", key, eventId, java.time.Duration.ofSeconds(30)); // twin still working
+
+        ResponseEntity<ProblemDetail> response =
+                http.postForEntity("/events/{id}/reserve", request("alice", key), ProblemDetail.class, eventId);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody().getType()).isEqualTo(ReservationController.IN_PROGRESS_TYPE);
+        assertThat(response.getHeaders().getFirst("Retry-After")).isEqualTo("1");
+
+        ResponseEntity<ProblemDetail> soldOut = http.postForEntity(
+                "/events/{id}/reserve", request("bob", newKey()), ProblemDetail.class, createEvent(0));
+        assertThat(soldOut.getBody().getType()).as("sold out is a different, final problem type")
+                .isEqualTo(ReservationController.SOLD_OUT_TYPE);
     }
 
     @Test

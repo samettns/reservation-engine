@@ -95,6 +95,42 @@ public class EventRepository {
                 .optional();
     }
 
+    /** Existence plus the versioned sold-out marker, in one primary-key read. */
+    public record Availability(long stockVersion, boolean soldOut) {
+    }
+
+    public Optional<Availability> findAvailability(long eventId) {
+        return jdbc.sql("""
+                        SELECT stock_version, sold_out_version = stock_version AS sold_out
+                        FROM events WHERE id = :id
+                        """)
+                .param("id", eventId)
+                .query((rs, rowNum) -> new Availability(rs.getLong("stock_version"), rs.getBoolean("sold_out")))
+                .optional();
+    }
+
+    /**
+     * Marks the event sold out AS OF {@code observedStockVersion} (read before the shards were
+     * probed). Compare-and-set: if units were returned in the meantime, the stock version moved on
+     * and nothing is marked, so the marker can never hide stock that came back.
+     */
+    public boolean markSoldOut(long eventId, long observedStockVersion) {
+        return jdbc.sql("""
+                        UPDATE events SET sold_out_version = :v
+                        WHERE id = :id AND stock_version = :v AND sold_out_version <> :v
+                        """)
+                .param("v", observedStockVersion)
+                .param("id", eventId)
+                .update() == 1;
+    }
+
+    /** Called when units come back (expired holds): invalidates any sold-out marker of this event. */
+    public void bumpStockVersion(long eventId) {
+        jdbc.sql("UPDATE events SET stock_version = stock_version + 1 WHERE id = :id")
+                .param("id", eventId)
+                .update();
+    }
+
     /**
      * Gives {@code units} back to one shard. Bumps the version too, so an optimistic-locking
      * reader that saw the old row retries instead of overwriting the returned units.

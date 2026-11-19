@@ -60,6 +60,10 @@ reservation:
     max-attempts: ${OPTIMISTIC_MAX_ATTEMPTS:10}
   # How long a reservation is held for payment before it expires and the unit returns to stock.
   hold-ttl: ${HOLD_TTL:PT10M}
+  idempotency:
+    # An IN_PROGRESS claim older than this is considered abandoned (its owner crashed) and can be
+    # taken over by a retry of the same request.
+    lease: ${IDEMPOTENCY_LEASE:PT30S}
   expiry:
     enabled: ${EXPIRY_ENABLED:true}
     # Every instance sweeps; they split the work with FOR UPDATE SKIP LOCKED.

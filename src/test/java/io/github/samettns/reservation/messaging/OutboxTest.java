@@ -9,6 +9,7 @@ import io.github.samettns.reservation.domain.ReservationOutcome;
 import io.github.samettns.reservation.domain.ReservationService;
 import io.github.samettns.reservation.domain.ReservationStatus;
 import io.github.samettns.reservation.infra.EventRepository;
+import io.github.samettns.reservation.infra.IdempotencyRepository;
 import io.github.samettns.reservation.infra.OutboxRepository;
 import io.github.samettns.reservation.infra.ReservationRepository;
 import io.github.samettns.reservation.strategy.ReservationStrategy;
@@ -60,6 +61,8 @@ class OutboxTest extends IntegrationTest {
     EventRepository events;
     @Autowired
     ReservationEvents reservationEvents;
+    @Autowired
+    IdempotencyRepository idempotency;
     @Autowired
     OutboxRepository outbox;
     @Autowired
@@ -277,7 +280,7 @@ class OutboxTest extends IntegrationTest {
 
     private ReservationService service() {
         ReservationStrategy atomic = strategies.stream().filter(s -> s.name().equals("atomic")).findFirst().orElseThrow();
-        return new ReservationService(atomic, reservations, events, reservationEvents, tx);
+        return new ReservationService(atomic, reservations, events, reservationEvents, idempotency, tx);
     }
 
     private HoldExpirySweeper sweeper() {

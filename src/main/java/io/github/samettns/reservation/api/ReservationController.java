@@ -7,6 +7,7 @@ import io.github.samettns.reservation.domain.ReservationService;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
@@ -16,6 +17,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.net.URI;
 import java.time.OffsetDateTime;
 import java.util.UUID;
 
@@ -24,6 +26,15 @@ public class ReservationController {
 
     static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
     static final String REPLAYED_HEADER = "Idempotent-Replayed";
+    static final URI SOLD_OUT_TYPE = URI.create("urn:problem-type:sold-out");
+    static final URI IN_PROGRESS_TYPE = URI.create("urn:problem-type:request-in-progress");
+
+    private static ProblemDetail problem(HttpStatus status, URI type, String title, String detail) {
+        ProblemDetail p = ProblemDetail.forStatusAndDetail(status, detail);
+        p.setType(type);
+        p.setTitle(title);
+        return p;
+    }
 
     private final ReservationService service;
 
@@ -61,7 +72,14 @@ public class ReservationController {
                     .body(ReservationResponse.from(r));
             case ReservationOutcome.SoldOut(long id) -> ResponseEntity
                     .status(HttpStatus.CONFLICT)
-                    .body(ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, "Event " + id + " is sold out"));
+                    .body(problem(HttpStatus.CONFLICT, SOLD_OUT_TYPE, "Sold out", "Event " + id + " is sold out"));
+            // Same status as the IETF Idempotency-Key draft recommends for a concurrent request with the
+            // same key; a distinct problem type (and Retry-After) tells clients it is NOT final.
+            case ReservationOutcome.InProgress(long id) -> ResponseEntity
+                    .status(HttpStatus.CONFLICT)
+                    .header(HttpHeaders.RETRY_AFTER, "1")
+                    .body(problem(HttpStatus.CONFLICT, IN_PROGRESS_TYPE, "Request in progress",
+                            "A request with this Idempotency-Key is being processed; retry to get its result"));
         };
     }
 

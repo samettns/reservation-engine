@@ -6,6 +6,7 @@ import io.github.samettns.reservation.domain.ReservationEvents;
 import io.github.samettns.reservation.domain.ReservationService;
 import io.github.samettns.reservation.domain.StockSnapshot;
 import io.github.samettns.reservation.infra.EventRepository;
+import io.github.samettns.reservation.infra.IdempotencyRepository;
 import io.github.samettns.reservation.infra.ReservationRepository;
 import io.github.samettns.reservation.support.ConcurrentRunner;
 import io.github.samettns.reservation.support.ConcurrentRunner.Attempt;
@@ -49,6 +50,8 @@ class StrategyConcurrencyTest extends IntegrationTest {
     EventRepository events;
     @Autowired
     ReservationEvents reservationEvents;
+    @Autowired
+    IdempotencyRepository idempotency;
     @Autowired
     TransactionTemplate tx;
     @Autowired
@@ -161,7 +164,7 @@ class StrategyConcurrencyTest extends IntegrationTest {
     void naiveStrategyOversells(int stock) {
         long eventId = events.create("concurrency-naive", stock);
         var naive = new NaiveStrategy(jdbc, stockShards, NAIVE_RACE_WINDOW);
-        ReservationService service = new ReservationService(naive, reservations, events, reservationEvents, tx);
+        ReservationService service = new ReservationService(naive, reservations, events, reservationEvents, idempotency, tx);
 
         Tally tally = reserveConcurrently(service, eventId, REQUESTS);
         StockSnapshot s = invariant.snapshot(eventId);
@@ -201,20 +204,16 @@ class StrategyConcurrencyTest extends IntegrationTest {
         StockSnapshot s = invariant.assertHolds(eventId, 1);
         assertThat(s.remaining()).isEqualTo(stock - 1);
 
+        // Stage 5b closed the stage-1 gap for EVERY strategy, including the Redis gate: the key is
+        // claimed (IN_PROGRESS, committed) before any stock is touched, so a twin either replays
+        // the finished result or is told "in progress". It is never told "sold out".
+        assertThat(tally.soldOut()).as("twins told 'sold out' although their request succeeded").isZero();
+        assertThat(tally.replayed() + tally.inProgress()).isEqualTo(99);
         if (strategyName.equals("redis")) {
-            // Losers' Redis decrements must have been given back by the rollback callback.
             invariant.assertRedisMatchesDatabase(eventId);
-            // KNOWN GAP (closed in stage 5 with in-progress idempotency records): while the
-            // winner is still in flight, its twins' pending Redis decrements can make the
-            // gate read 0, so some twins answer "sold out" for a request that succeeded.
-            // Safe for stock (no overselling) but a wrong answer to the client.
-            assertThat(tally.created() + tally.replayed() + tally.soldOut()).isEqualTo(100);
-        } else {
-            // DB strategies: twins wait on the row lock until the winner commits, then the
-            // sold-out re-check finds the winner. Every twin must get the original result.
-            assertThat(tally.soldOut()).as("twins told 'sold out' although their request succeeded").isZero();
-            assertThat(tally.replayed()).isEqualTo(99);
         }
+        // A twin that was told "in progress" and retries afterwards gets the original result.
+        assertThat(service.reserve(eventId, "alice", sameKey)).isInstanceOf(ReservationOutcome.Replayed.class);
     }
 
     static Stream<Arguments> correctStrategiesAndSmallStock() {
@@ -228,7 +227,7 @@ class StrategyConcurrencyTest extends IntegrationTest {
         // One attempt only: anyone who loses the first race must give up.
         var meters = new SimpleMeterRegistry();
         var oneShot = new OptimisticLockingStrategy(jdbc, stockShards, 1, meters);
-        ReservationService service = new ReservationService(oneShot, reservations, events, reservationEvents, tx);
+        ReservationService service = new ReservationService(oneShot, reservations, events, reservationEvents, idempotency, tx);
 
         Tally tally = reserveConcurrently(service, eventId, 200);
         System.out.printf("[optimistic max-attempts=1] %s%n", tally);
@@ -246,7 +245,7 @@ class StrategyConcurrencyTest extends IntegrationTest {
         long eventId = events.create("optimistic-metrics", 1_000_000);
         var meters = new SimpleMeterRegistry();
         var strategy = new OptimisticLockingStrategy(jdbc, stockShards, 10, meters);
-        ReservationService service = new ReservationService(strategy, reservations, events, reservationEvents, tx);
+        ReservationService service = new ReservationService(strategy, reservations, events, reservationEvents, idempotency, tx);
 
         Tally tally = reserveConcurrently(service, eventId, 500);
         DistributionSummary acquired = attempts(meters, "acquired");
@@ -282,14 +281,15 @@ class StrategyConcurrencyTest extends IntegrationTest {
                 .filter(s -> s.name().equals(strategyName))
                 .findFirst()
                 .orElseThrow();
-        return new ReservationService(strategy, reservations, events, reservationEvents, tx);
+        return new ReservationService(strategy, reservations, events, reservationEvents, idempotency, tx);
     }
 
     /** Counts of each outcome over a run. */
-    record Tally(long created, long replayed, long soldOut, long contended, List<Throwable> unexpectedErrors) {
+    record Tally(long created, long replayed, long soldOut, long inProgress, long contended,
+                 List<Throwable> unexpectedErrors) {
 
         static Tally of(List<Attempt<ReservationOutcome>> attempts) {
-            long created = 0, replayed = 0, soldOut = 0, contended = 0;
+            long created = 0, replayed = 0, soldOut = 0, inProgress = 0, contended = 0;
             List<Throwable> unexpected = new ArrayList<>();
             for (Attempt<ReservationOutcome> a : attempts) {
                 if (a.failed()) {
@@ -304,15 +304,16 @@ class StrategyConcurrencyTest extends IntegrationTest {
                     case ReservationOutcome.Created c -> created++;
                     case ReservationOutcome.Replayed r -> replayed++;
                     case ReservationOutcome.SoldOut s -> soldOut++;
+                    case ReservationOutcome.InProgress p -> inProgress++;
                 }
             }
-            return new Tally(created, replayed, soldOut, contended, unexpected);
+            return new Tally(created, replayed, soldOut, inProgress, contended, unexpected);
         }
 
         @Override
         public String toString() {
-            return "created=%d replayed=%d soldOut=%d contended=%d errors=%d"
-                    .formatted(created, replayed, soldOut, contended, unexpectedErrors.size());
+            return "created=%d replayed=%d soldOut=%d inProgress=%d contended=%d errors=%d"
+                    .formatted(created, replayed, soldOut, inProgress, contended, unexpectedErrors.size());
         }
     }
 }

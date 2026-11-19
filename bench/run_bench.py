@@ -158,7 +158,8 @@ def start_strategy(strategy):
 
 def reset_state():
     sh("docker", "compose", "exec", "-T", "postgres", "psql", "-U", "reservation", "-d", "reservation",
-       "-q", "-c", "TRUNCATE reservations, stock, events RESTART IDENTITY")
+       "-q", "-c", "TRUNCATE reservations, stock, events, idempotency_keys, outbox, consumer_inbox, "
+                   "notifications RESTART IDENTITY")
     sh("docker", "compose", "exec", "-T", "redis", "redis-cli", "FLUSHALL")
 
 

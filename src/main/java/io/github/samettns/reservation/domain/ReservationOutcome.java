@@ -11,11 +11,19 @@ public sealed interface ReservationOutcome {
     record Created(Reservation reservation) implements ReservationOutcome {
     }
 
-    /** The same (user, idempotency key) was seen before; the original result is returned. */
+    /** The same (user, idempotency key) was completed before; the original result is returned. */
     record Replayed(Reservation reservation) implements ReservationOutcome {
     }
 
     /** No stock left. */
     record SoldOut(long eventId) implements ReservationOutcome {
+    }
+
+    /**
+     * Another request with the same (user, idempotency key) is being processed right now. The
+     * client should retry shortly and will then get that request's result. Answering anything else
+     * here (e.g. "sold out" because the twin took the last unit) would be wrong.
+     */
+    record InProgress(long eventId) implements ReservationOutcome {
     }
 }

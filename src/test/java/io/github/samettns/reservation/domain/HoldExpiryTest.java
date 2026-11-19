@@ -2,6 +2,7 @@ package io.github.samettns.reservation.domain;
 
 import io.github.samettns.reservation.IntegrationTest;
 import io.github.samettns.reservation.infra.EventRepository;
+import io.github.samettns.reservation.infra.IdempotencyRepository;
 import io.github.samettns.reservation.infra.ReservationRepository;
 import io.github.samettns.reservation.strategy.ReservationStrategy;
 import io.github.samettns.reservation.strategy.StockReturnListener;
@@ -47,6 +48,8 @@ class HoldExpiryTest extends IntegrationTest {
     EventRepository events;
     @Autowired
     ReservationEvents reservationEvents;
+    @Autowired
+    IdempotencyRepository idempotency;
     @Autowired
     TransactionTemplate tx;
     @Autowired
@@ -341,7 +344,7 @@ class HoldExpiryTest extends IntegrationTest {
     private ReservationService service(String strategyName) {
         ReservationStrategy strategy = strategies.stream()
                 .filter(s -> s.name().equals(strategyName)).findFirst().orElseThrow();
-        return new ReservationService(strategy, reservations, events, reservationEvents, tx);
+        return new ReservationService(strategy, reservations, events, reservationEvents, idempotency, tx);
     }
 
     /** A new sweeper object = what one app instance runs. */

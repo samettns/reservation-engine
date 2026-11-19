@@ -94,7 +94,12 @@ public class HoldExpirySweeper {
             events.returnStock(shard.eventId(), shard.shardNo(), units);
             unitsPerEvent.merge(shard.eventId(), units, Integer::sum);
         });
-        unitsPerEvent.forEach((eventId, units) -> listeners.forEach(l -> l.onStockReturned(eventId, units)));
+        unitsPerEvent.forEach((eventId, units) -> {
+            // Stock came back: invalidate the event's sold-out marker (same transaction as the return).
+            // Done after all stock rows (fixed lock order: stock rows, then event rows).
+            events.bumpStockVersion(eventId);
+            listeners.forEach(l -> l.onStockReturned(eventId, units)); // e.g. Redis counter += units after commit
+        });
         expiredCounter.increment(expired.size());
         return expired.size();
     }

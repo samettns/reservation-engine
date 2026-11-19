@@ -24,4 +24,13 @@ public interface ReservationStrategy {
      *                             stock may still be available and the client may retry
      */
     OptionalInt tryAcquireOne(long eventId);
+
+    /**
+     * A cheap, strategy-specific "definitely sold out" check that touches no stock row, used to
+     * answer most requests of a sold-out event without a transaction. Must never return true
+     * while stock is available; returning false is always safe.
+     */
+    default boolean knownSoldOut(long eventId) {
+        return false;
+    }
 }
