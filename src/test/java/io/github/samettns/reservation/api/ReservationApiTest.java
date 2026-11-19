@@ -1,14 +1,12 @@
 package io.github.samettns.reservation.api;
 
-import io.github.samettns.reservation.TestcontainersConfiguration;
+import io.github.samettns.reservation.IntegrationTest;
 import io.github.samettns.reservation.api.EventController.EventCreatedResponse;
 import io.github.samettns.reservation.api.ReservationController.ReservationResponse;
 import io.github.samettns.reservation.domain.StockSnapshot;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
-import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -20,9 +18,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-@Import(TestcontainersConfiguration.class)
-class ReservationApiTest {
+class ReservationApiTest extends IntegrationTest {
 
     @Autowired
     TestRestTemplate http;
