@@ -9,11 +9,12 @@ import org.springframework.context.annotation.Import;
  * lets Spring reuse a single application context (and a single set of containers)
  * across all test classes instead of starting new ones per class.
  *
- * <p>The scheduled hold-expiry sweeper is disabled: tests that need expiry run sweepers
- * explicitly, so a background sweep can never change state in the middle of an assertion.
+ * <p>Background jobs are disabled: the hold-expiry sweeper and the outbox relay are created and
+ * driven explicitly by the tests that need them, so a background run can never change state in
+ * the middle of an assertion. The Kafka consumer stays on.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = "reservation.expiry.enabled=false")
+        properties = {"reservation.expiry.enabled=false", "reservation.events.relay.enabled=false"})
 @Import({TestcontainersConfiguration.class, StockInvariant.class})
 public abstract class IntegrationTest {
 }

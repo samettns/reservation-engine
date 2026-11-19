@@ -2,6 +2,7 @@ package io.github.samettns.reservation.strategy;
 
 import io.github.samettns.reservation.IntegrationTest;
 import io.github.samettns.reservation.domain.ReservationOutcome;
+import io.github.samettns.reservation.domain.ReservationEvents;
 import io.github.samettns.reservation.domain.ReservationService;
 import io.github.samettns.reservation.domain.StockSnapshot;
 import io.github.samettns.reservation.infra.EventRepository;
@@ -46,6 +47,8 @@ class StrategyConcurrencyTest extends IntegrationTest {
     ReservationRepository reservations;
     @Autowired
     EventRepository events;
+    @Autowired
+    ReservationEvents reservationEvents;
     @Autowired
     TransactionTemplate tx;
     @Autowired
@@ -158,7 +161,7 @@ class StrategyConcurrencyTest extends IntegrationTest {
     void naiveStrategyOversells(int stock) {
         long eventId = events.create("concurrency-naive", stock);
         var naive = new NaiveStrategy(jdbc, stockShards, NAIVE_RACE_WINDOW);
-        ReservationService service = new ReservationService(naive, reservations, events, tx);
+        ReservationService service = new ReservationService(naive, reservations, events, reservationEvents, tx);
 
         Tally tally = reserveConcurrently(service, eventId, REQUESTS);
         StockSnapshot s = invariant.snapshot(eventId);
@@ -225,7 +228,7 @@ class StrategyConcurrencyTest extends IntegrationTest {
         // One attempt only: anyone who loses the first race must give up.
         var meters = new SimpleMeterRegistry();
         var oneShot = new OptimisticLockingStrategy(jdbc, stockShards, 1, meters);
-        ReservationService service = new ReservationService(oneShot, reservations, events, tx);
+        ReservationService service = new ReservationService(oneShot, reservations, events, reservationEvents, tx);
 
         Tally tally = reserveConcurrently(service, eventId, 200);
         System.out.printf("[optimistic max-attempts=1] %s%n", tally);
@@ -243,7 +246,7 @@ class StrategyConcurrencyTest extends IntegrationTest {
         long eventId = events.create("optimistic-metrics", 1_000_000);
         var meters = new SimpleMeterRegistry();
         var strategy = new OptimisticLockingStrategy(jdbc, stockShards, 10, meters);
-        ReservationService service = new ReservationService(strategy, reservations, events, tx);
+        ReservationService service = new ReservationService(strategy, reservations, events, reservationEvents, tx);
 
         Tally tally = reserveConcurrently(service, eventId, 500);
         DistributionSummary acquired = attempts(meters, "acquired");
@@ -279,7 +282,7 @@ class StrategyConcurrencyTest extends IntegrationTest {
                 .filter(s -> s.name().equals(strategyName))
                 .findFirst()
                 .orElseThrow();
-        return new ReservationService(strategy, reservations, events, tx);
+        return new ReservationService(strategy, reservations, events, reservationEvents, tx);
     }
 
     /** Counts of each outcome over a run. */

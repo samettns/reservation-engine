@@ -22,6 +22,7 @@ public class ReservationService {
     private final ReservationStrategy strategy;
     private final ReservationRepository reservations;
     private final EventRepository events;
+    private final ReservationEvents outbox;
     private final TransactionTemplate tx;
     private final Duration holdTtl;
 
@@ -29,19 +30,21 @@ public class ReservationService {
     public ReservationService(ReservationStrategy strategy,
                               ReservationRepository reservations,
                               EventRepository events,
+                              ReservationEvents outbox,
                               TransactionTemplate tx,
                               @Value("${reservation.hold-ttl:PT10M}") Duration holdTtl) {
         this.strategy = strategy;
         this.reservations = reservations;
         this.events = events;
+        this.outbox = outbox;
         this.tx = tx;
         this.holdTtl = holdTtl;
     }
 
     /** Convenience for tests that wire a service with a specific strategy. */
     public ReservationService(ReservationStrategy strategy, ReservationRepository reservations,
-                              EventRepository events, TransactionTemplate tx) {
-        this(strategy, reservations, events, tx, DEFAULT_HOLD_TTL);
+                              EventRepository events, ReservationEvents outbox, TransactionTemplate tx) {
+        this(strategy, reservations, events, outbox, tx, DEFAULT_HOLD_TTL);
     }
 
     /** Takes one unit and HOLDS it until {@code now + hold-ttl}; payment must confirm it before then. */
@@ -68,6 +71,7 @@ public class ReservationService {
                 // The shard is stored so that an expired hold returns its unit to the same row.
                 Reservation created = reservations.insertHeld(
                         eventId, shard.getAsInt(), userId, idempotencyKey, holdTtl);
+                outbox.held(created); // same transaction: no hold without its event, no event without its hold
                 return new ReservationOutcome.Created(created);
             });
             if (outcome instanceof ReservationOutcome.SoldOut) {
@@ -94,7 +98,11 @@ public class ReservationService {
      * (payment providers retry callbacks): confirming an already confirmed hold returns it again.
      */
     public ConfirmOutcome confirm(UUID reservationId) {
-        Optional<Reservation> confirmed = reservations.confirmIfHeld(reservationId);
+        Optional<Reservation> confirmed = tx.execute(status -> {
+            Optional<Reservation> r = reservations.confirmIfHeld(reservationId);
+            r.ifPresent(outbox::confirmed); // event only if THIS call made the transition
+            return r;
+        });
         if (confirmed.isPresent()) {
             return new ConfirmOutcome.Confirmed(confirmed.get());
         }

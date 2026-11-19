@@ -46,6 +46,8 @@ class HoldExpiryTest extends IntegrationTest {
     @Autowired
     EventRepository events;
     @Autowired
+    ReservationEvents reservationEvents;
+    @Autowired
     TransactionTemplate tx;
     @Autowired
     JdbcClient jdbc;
@@ -339,12 +341,12 @@ class HoldExpiryTest extends IntegrationTest {
     private ReservationService service(String strategyName) {
         ReservationStrategy strategy = strategies.stream()
                 .filter(s -> s.name().equals(strategyName)).findFirst().orElseThrow();
-        return new ReservationService(strategy, reservations, events, tx);
+        return new ReservationService(strategy, reservations, events, reservationEvents, tx);
     }
 
     /** A new sweeper object = what one app instance runs. */
     private HoldExpirySweeper sweeper(int batchSize) {
-        return new HoldExpirySweeper(reservations, events, stockReturnListeners, tx, batchSize, new SimpleMeterRegistry());
+        return new HoldExpirySweeper(reservations, events, reservationEvents, stockReturnListeners, tx, batchSize, new SimpleMeterRegistry());
     }
 
     private static Reservation hold(ReservationService service, long eventId, String user) {

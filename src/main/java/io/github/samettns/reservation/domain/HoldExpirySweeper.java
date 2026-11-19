@@ -40,6 +40,7 @@ public class HoldExpirySweeper {
 
     private final ReservationRepository reservations;
     private final EventRepository events;
+    private final ReservationEvents outbox;
     private final List<StockReturnListener> listeners;
     private final TransactionTemplate tx;
     private final int batchSize;
@@ -48,12 +49,14 @@ public class HoldExpirySweeper {
     @Autowired
     public HoldExpirySweeper(ReservationRepository reservations,
                              EventRepository events,
+                             ReservationEvents outbox,
                              List<StockReturnListener> listeners,
                              TransactionTemplate tx,
                              @Value("${reservation.expiry.batch-size:200}") int batchSize,
                              MeterRegistry meters) {
         this.reservations = reservations;
         this.events = events;
+        this.outbox = outbox;
         this.listeners = listeners;
         this.tx = tx;
         this.batchSize = batchSize;
@@ -84,6 +87,7 @@ public class HoldExpirySweeper {
         Map<ShardKey, Integer> unitsPerShard = new TreeMap<>(LOCK_ORDER);
         for (ExpiredHold hold : expired) {
             unitsPerShard.merge(new ShardKey(hold.eventId(), hold.shardNo()), 1, Integer::sum);
+            outbox.expired(hold.id(), hold.eventId(), hold.shardNo()); // same transaction as the expiry
         }
         Map<Long, Integer> unitsPerEvent = new TreeMap<>();
         unitsPerShard.forEach((shard, units) -> {
