@@ -50,6 +50,7 @@ curl localhost:8080/events/1/stock
 | `atomic` | `UPDATE ... SET qty = qty - 1 WHERE ... AND qty > 0`, tek ifade |
 | `optimistic` | Version kolonu ile compare-and-set, sınırlı yeniden deneme |
 | `pessimistic` | `SELECT ... FOR UPDATE`, sonra yazma |
+| `pessimistic-precheck` | Önce kilitsiz `SELECT`; stok 0 ise kilitlemeden "tükendi", değilse `FOR UPDATE` ile doğrulama |
 | `redis` | Redis'te Lua script ile atomik kapı, ardından PostgreSQL'de atomik UPDATE. Kaynak doğruluk PostgreSQL |
 
 ## Benchmark
@@ -122,9 +123,78 @@ Hızlı ama yanlış.
 %40'a varan fark gözlendi). k6 ve uygulamalar aynı CPU'yu paylaşıyor. Disk WSL2 sanal diski
 (fsync maliyeti gerçek sunucudan farklı).
 
+## Stock sharding (Aşama 3)
+
+Bir etkinliğin stoğu N satıra (shard) bölünebiliyor: `POST /events {"name":..., "stock":..., "shards": 16}`.
+İstek rastgele bir shard'dan başlıyor, boşsa sıradakine geçiyor; **"tükendi" cevabı ancak bütün shard'lar
+denendikten sonra veriliyor.** Sharding kilitleme stratejisinden bağımsız bir katman: her strateji sadece
+"tek satırdan bir birim al" işini yapıyor, hangi satırın deneneceğine `StockShards` karar veriyor.
+Komut: `bash bench/run-sharding.sh`. Tam tablo: [`docs/benchmarks/sharding/summary.md`](docs/benchmarks/sharding/summary.md).
+
+> ⚠️ **Ön sonuç** (tek koşu). Gürültü ölçüsü: aynı konfigürasyon iki ayrı koşuda 480 ve 626 rezervasyon/sn verdi.
+
+**1. Yazma throughput'u (stok bitmiyor): 16 shard ile 3–5 kat.**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/sharding/sharding-contention-dark.png">
+  <img alt="Sharding: reservations per second" src="docs/benchmarks/sharding/sharding-contention.png">
+</picture>
+
+| 1.000 kullanıcı | 1 shard | 16 shard | Kat |
+|---|---:|---:|---:|
+| atomic | 602 | 3.095 | 5,1× |
+| optimistic | 474 | 2.342 | 4,9× |
+| pessimistic | 520 | 2.239 | 4,3× |
+| pessimistic + pre-check | 515 | 2.341 | 4,5× |
+
+- Atomic'in p99'u 5,4 sn'den 1,3 sn'ye düşüyor.
+- **Darboğazın sıcak satır olduğunun doğrudan kanıtı:** Tek shard'da aktif PostgreSQL oturumlarının
+  %55–92'si bir satır kilidini (`Lock`) bekliyor (`pg_stat_activity`'den saniyede bir örneklendi).
+  10 kullanıcı ve 16 shard'da bu oran %13–22'ye iniyor.
+- 100 ve 1.000 kullanıcıda 16 shard'la bile kilit beklemesi %69–80'de kalıyor: veritabanına aynı anda 60
+  bağlantı (3 × 20) ulaşabiliyor, satır başına ~4 oturum düşüyor. Daha fazla shard bu oranı düşürür.
+
+**2. Flaş satış: sharding "tükendi" yanıtını pahalılaştırıyor.**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/sharding/sharding-sellout-dark.png">
+  <img alt="Sharding: flash sale requests per second" src="docs/benchmarks/sharding/sharding-sellout.png">
+</picture>
+
+- Stok bittikten sonra her "tükendi" yanıtı **bütün shard'ları tek tek denemek zorunda** (16 shard = 16
+  UPDATE). Atomic'te 16 shard, 1 shard'a göre %22–47 daha yavaş. 4 shard'da fark gürültü sınırında.
+- Bu, sharding'in temel trade-off'u: yazmayı hızlandırırken "yok" demeyi pahalılaştırıyor. Çözüm adayı,
+  bütün shard'lar boşalınca tutulan bir "tükendi" işareti (O(1) reddetme). Aşama 5'teki Redis "tükendi"
+  kısayoluyla birlikte ele alınacak.
+
+**3. Pessimistic + kilitsiz ön kontrol (pre-check):**
+
+| Flaş satış, 1 shard (req/s) | pessimistic | pessimistic + pre-check | Kat |
+|---|---:|---:|---:|
+| 10 kullanıcı | 1.076 | 2.643 | 2,5× |
+| 100 kullanıcı | 1.065 | 4.615 | 4,3× |
+| 1.000 kullanıcı | 968 | 3.204 | 3,3× |
+
+- Ön kontrol, pessimistic'in flaş satıştaki zayıflığını gideriyor: stok 0 ise satır kilidine hiç
+  dokunmadan "tükendi" diyor. Böylece atomic ve optimistic ile aynı seviyeye geliyor.
+- Bedeli: stok bitmediği sürece her istek bir sorgu fazla yapıyor. Yazma senaryosunda fark −%12 ile +%10
+  arasında, yani gürültü sınırında.
+
+**Bu aşamada bulunan iki hata:**
+- **Deadlock (pessimistic + sharding):** İstekler shard'ları farklı sırayla gezip boş shard'ların kilidini
+  tutarken birbirini bekliyordu. Boş shard'ın kilidi artık bir savepoint'e geri dönülerek hemen bırakılıyor.
+  PostgreSQL'in `ROLLBACK TO SAVEPOINT` ile satır kilidini bıraktığı ayrı bir deneyle doğrulandı. Düzeltme
+  kaldırılınca testlerde 174 deadlock çıkıyor.
+- **Önbellek hatası:** Shard sayısı etkinlik ID'sine göre önbelleğe alınıyordu. Benchmark ID'leri yeniden
+  kullanınca (`RESTART IDENTITY`) 16 shard'lı etkinlikler tek shard'lı sanıldı ve stok varken "tükendi"
+  denildi. Önbellek kaldırıldı. Benchmark artık her koşudan sonra "satılmamış stok kaldı mı?" ve "bütün
+  shard'lar kullanıldı mı?" diye kendini de kontrol ediyor.
+
 ## Bilinen sınırlamalar
 
 | Sınırlama | Etki | Çözüm planı |
 |---|---|---|
 | **Redis stratejisinde eşzamanlı idempotent tekrarlar.** Aynı `Idempotency-Key` ile gelen kopyalar, ilk istek henüz commit edilmemişken Redis sayacını geçici olarak 0 görüp `409` alabilir. | Stok doğru kalır (overselling yok), ama başarılı olmuş bir isteğin kopyasına "tükendi" denir. Ölçüm: stok 1'de 100 eşzamanlı kopyadan ~8'i. DB stratejileri etkilenmez. | Aşama 5: istek işlenirken idempotency kaydını "işlemde" olarak tutmak. |
+| **Sharding'de "tükendi" yanıtı bütün shard'ları geziyor.** | 16 shard'da flaş satış %22–47 yavaşlıyor. | Aşama 5: "tükendi" kısayolu / işareti (Redis kısayoluyla birlikte). |
+| **Shard sayısı etkinlik oluşturulurken sabitleniyor.** | Yayındaki bir etkinliğin shard sayısı değiştirilemez (resharding yok). | Kapsam dışı. |
 | **Redis düşüşü ile DB sonucu arasında çökme.** Redis'ten birim düşüldükten sonra, DB transaction'ı sonuçlanıp telafi (`INCR`) çalışmadan uygulama çökerse, düşülen birim Redis'e hiç iade edilmez. | Redis sayacı DB'den düşük kalır: o birimler satılamaz (undersell). Overselling'e yol açmaz, çünkü son kararı DB veriyor. | Aşama 7: Redis sayacını DB'deki kalan stokla eşitleyen bir mutabakat (reconciliation) işi. |
