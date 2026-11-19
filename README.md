@@ -34,7 +34,8 @@ curl localhost:8080/events/1/stock
 |---|---|
 | Rezervasyon oluşturuldu | `201 Created` |
 | Aynı istek tekrar geldi (replay) | `200 OK` + `Idempotent-Replayed: true` |
-| Stok tükendi | `409 Conflict` |
+| Stok tükendi | `409 Conflict` (`urn:problem-type:sold-out`) |
+| Aynı key'li başka bir istek şu an işleniyor | `409 Conflict` (`urn:problem-type:request-in-progress`) + `Retry-After` |
 | Etkinlik yok | `404 Not Found` |
 | Key başka bir etkinlik için kullanılmış | `422 Unprocessable Entity` |
 | `Idempotency-Key` eksik / geçersiz gövde | `400 Bad Request` |
@@ -176,9 +177,9 @@ Komut: `bash bench/run-sharding.sh`. Tam tablo: [`docs/benchmarks/sharding/summa
 
 - Stok bittikten sonra her "tükendi" yanıtı **bütün shard'ları tek tek denemek zorunda** (16 shard = 16
   UPDATE). Atomic'te 16 shard, 1 shard'a göre %22–47 daha yavaş. 4 shard'da fark gürültü sınırında.
-- Bu, sharding'in temel trade-off'u: yazmayı hızlandırırken "yok" demeyi pahalılaştırıyor. Çözüm adayı,
-  bütün shard'lar boşalınca tutulan bir "tükendi" işareti (O(1) reddetme). Aşama 5'teki Redis "tükendi"
-  kısayoluyla birlikte ele alınacak.
+- Bu, sharding'in temel trade-off'u: yazmayı hızlandırırken "yok" demeyi pahalılaştırıyor.
+  **Aşama 5b'de çözüldü:** versiyonlu "tükendi" işaretiyle 16 shard'lı flaş satış +%176 ile +%307 hızlandı
+  (aşağıda).
 
 **3. Pessimistic + kilitsiz ön kontrol (pre-check):**
 
@@ -263,13 +264,54 @@ yayınlanmamış satırları alıp Kafka'ya gönderiyor ve broker onayından son
   (relay başına 1.215 / 1.083 / 702). 3.000 bildirim oluştu (consumer başına 1.019 / 998 / 983). Sırası bozuk
   rezervasyon 0.
 
+## Idempotency "işlemde" durumu ve "tükendi" kısayolları (Aşama 5b)
+
+**Idempotency claim.** İstek, stoğa dokunmadan **önce** `(kullanıcı, Idempotency-Key)` çiftini `IN_PROGRESS`
+olarak ayrı bir transaction'da commit ediyor. `COMPLETED` durumu, rezervasyonla aynı transaction'da yazılıyor.
+Yan etkisi olmayan istekler (tükendi, 503, hata) key'i serbest bırakıyor. Aynı anda gelen ikiz istek, stok için
+yarışmak yerine **`409` + `urn:problem-type:request-in-progress`** ve `Retry-After` alıyor. Tekrar denediğinde
+asıl sonucu görüyor. Sahibi çöken bir claim, kira süresi (`IDEMPOTENCY_LEASE`, 30 sn) dolunca devralınabiliyor.
+Bu, Aşama 1'deki açığı **bütün stratejiler için** kapattı: aynı key'li 100 eşzamanlı istekten "tükendi" alan sayısı
+0 (önceden Redis'te 8'e kadar).
+
+**"Tükendi" kısayolları** (stok satırına ve transaction'a dokunmadan cevap):
+- **Redis:** Kapı sayacı 0 ise tek bir Redis `GET` yetiyor.
+- **Versiyonlu "tükendi" işareti (DB stratejileri):** Bütün shard'ları boş bulan istek, etkinlik satırına
+  "şu stok versiyonunda tükendi" yazıyor (compare-and-set). Sonraki istekler bunu tek bir PK okumasıyla görüyor.
+- **Stok iadesinde temizleniyor:** Süresi dolan bir rezervasyon birim iade edince etkinliğin stok versiyonu artıyor
+  (işaret kendiliğinden geçersizleşiyor) ve Redis sayacı artıyor (kısayol kapanıyor). İkisi de testli.
+- **Kısayol bile idempotency'ye bakıyor:** Başarılı bir isteğin tekrarı "tükendi" değil, kendi sonucunu alıyor.
+
+**Flaş satış, önce / sonra** (aynı makine, aynı oturumda arka arkaya ölçüldü; ⚠️ ön sonuç, tek koşu).
+Tam tablo: [`docs/benchmarks/sellout-5b/summary.md`](docs/benchmarks/sellout-5b/summary.md).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/benchmarks/sellout-5b/sellout-before-after-dark.png">
+  <img alt="Sellout before and after the sold-out shortcuts" src="docs/benchmarks/sellout-5b/sellout-before-after.png">
+</picture>
+
+| req/s (100 kullanıcı) | önce | sonra | değişim |
+|---|---:|---:|---:|
+| atomic, 1 shard | 2.074 | 2.364 | +%14 |
+| atomic, 16 shard | 1.308 | 5.324 | **+%307** |
+| pessimistic + pre-check, 16 shard | 1.356 | 3.844 | +%184 |
+| redis, 1 shard | 2.217 | 2.823 | +%27 |
+| redis, 16 shard | 4.161 | 6.336 | +%52 |
+
+- **En büyük kazanç shard'lı etkinliklerde** (+%176 ile +%307): Aşama 3'te bulunan "her 'tükendi' için bütün
+  shard'ları gez" maliyeti ortadan kalktı. 16 shard artık flaş satışta da 1 shard'dan hızlı.
+- **Tek shard'da +%5 ile +%85:** "Tükendi" yolu eskiden 3 okuma + 1 UPDATE yapıyordu; şimdi 2 okuma (DB) ya da
+  1 Redis + 1 okuma.
+- Satılmamış stok hiçbir koşuda kalmadı; overselling yok.
+- **Bedeli:** Başarılı her rezervasyon artık bir commit fazla yapıyor (claim). Bu ölçümde 20.000 istekten
+  sadece 1.000'i başarılı olduğu için etkisi küçük. Yazma ağırlıklı senaryodaki etkisi final benchmark'ta (Aşama 8)
+  ölçülecek.
+
 ## Bilinen sınırlamalar
 
 | Sınırlama | Etki | Çözüm planı |
 |---|---|---|
-| **Redis stratejisinde eşzamanlı idempotent tekrarlar.** Aynı `Idempotency-Key` ile gelen kopyalar, ilk istek henüz commit edilmemişken Redis sayacını geçici olarak 0 görüp `409` alabilir. | Stok doğru kalır (overselling yok), ama başarılı olmuş bir isteğin kopyasına "tükendi" denir. Ölçüm: stok 1'de 100 eşzamanlı kopyadan ~8'i. DB stratejileri etkilenmez. | Aşama 5: istek işlenirken idempotency kaydını "işlemde" olarak tutmak. |
-| **Sharding'de "tükendi" yanıtı bütün shard'ları geziyor.** | 16 shard'da flaş satış %22–47 yavaşlıyor. | Aşama 5: "tükendi" kısayolu / işareti (Redis kısayoluyla birlikte). |
-| **İade edilen stok ile "tükendi" işareti.** Süresi dolan rezervasyonlar stoğu geri getiriyor. | Aşama 5'te eklenecek "tükendi" işareti ve Redis kısayolu, stok iade edildiğinde temizlenmezse geri gelen birimler bir daha satılamaz. | Aşama 5 tasarımının parçası (iade = işareti temizle). |
+| **Idempotency claim'i her başarılı rezervasyona bir commit ekliyor.** | Yazma ağırlıklı senaryoda throughput'a etkisi henüz ölçülmedi. | Aşama 8 (final benchmark). |
 | **Zehirli mesaj partition'ı durdurabilir.** Consumer'da işlenemeyen bir mesaj yeniden denenirken aynı partition'daki sonraki mesajlar bekliyor (geliştirme sırasında bir NULL hatasıyla yaşandı). | Bir hata, bir partition'daki bütün olayları geciktirir. | Aşama 7: dead-letter topic. |
 | **Outbox tablosu büyüyor.** Yayınlanmış satırlar silinmiyor. | Disk kullanımı zamanla artar. | Saklama süresi dolanları silen bir temizlik işi (kapsam dışı, not edildi). |
 | **Shard sayısı etkinlik oluşturulurken sabitleniyor.** | Yayındaki bir etkinliğin shard sayısı değiştirilemez (resharding yok). | Kapsam dışı. |
