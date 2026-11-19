@@ -1,6 +1,7 @@
 package io.github.samettns.reservation.strategy;
 
 import io.github.samettns.reservation.strategy.StockShards.RowResult;
+import io.github.samettns.reservation.strategy.StockShards.ShardRow;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
 
@@ -45,16 +46,16 @@ public class PessimisticLockingStrategy implements ReservationStrategy {
         return shards.acquire(eventId, this::tryRow);
     }
 
-    RowResult tryRow(long eventId, int shardNo) {
+    RowResult tryRow(ShardRow row) {
         // With a single row there is no other stock lock to wait for, so no deadlock risk
         // and no need to pay for the extra savepoint round trips.
-        boolean multiShard = shards.shardCount(eventId) > 1;
+        boolean multiShard = !row.onlyShard();
         if (multiShard) {
             jdbc.sql("SAVEPOINT " + SAVEPOINT).update();
         }
         int qty = jdbc.sql("SELECT qty FROM stock WHERE event_id = :eventId AND shard_no = :shardNo FOR UPDATE")
-                .param("eventId", eventId)
-                .param("shardNo", shardNo)
+                .param("eventId", row.eventId())
+                .param("shardNo", row.shardNo())
                 .query(Integer.class)
                 .single();
         if (qty <= 0) {
@@ -67,8 +68,8 @@ public class PessimisticLockingStrategy implements ReservationStrategy {
             jdbc.sql("RELEASE SAVEPOINT " + SAVEPOINT).update(); // keep the lock until commit
         }
         jdbc.sql("UPDATE stock SET qty = qty - 1 WHERE event_id = :eventId AND shard_no = :shardNo")
-                .param("eventId", eventId)
-                .param("shardNo", shardNo)
+                .param("eventId", row.eventId())
+                .param("shardNo", row.shardNo())
                 .update();
         return RowResult.ACQUIRED;
     }

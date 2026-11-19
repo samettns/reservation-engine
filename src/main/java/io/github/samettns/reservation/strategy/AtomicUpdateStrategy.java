@@ -1,6 +1,7 @@
 package io.github.samettns.reservation.strategy;
 
 import io.github.samettns.reservation.strategy.StockShards.RowResult;
+import io.github.samettns.reservation.strategy.StockShards.ShardRow;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
 
@@ -32,13 +33,13 @@ public class AtomicUpdateStrategy implements ReservationStrategy {
         return shards.acquire(eventId, this::tryRow);
     }
 
-    private RowResult tryRow(long eventId, int shardNo) {
+    private RowResult tryRow(ShardRow row) {
         int updatedRows = jdbc.sql("""
                         UPDATE stock SET qty = qty - 1
                         WHERE event_id = :eventId AND shard_no = :shardNo AND qty > 0
                         """)
-                .param("eventId", eventId)
-                .param("shardNo", shardNo)
+                .param("eventId", row.eventId())
+                .param("shardNo", row.shardNo())
                 .update();
         return updatedRows == 1 ? RowResult.ACQUIRED : RowResult.EMPTY;
     }

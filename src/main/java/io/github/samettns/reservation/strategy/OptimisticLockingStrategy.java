@@ -1,6 +1,7 @@
 package io.github.samettns.reservation.strategy;
 
 import io.github.samettns.reservation.strategy.StockShards.RowResult;
+import io.github.samettns.reservation.strategy.StockShards.ShardRow;
 import io.micrometer.core.instrument.DistributionSummary;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -77,13 +78,13 @@ public class OptimisticLockingStrategy implements ReservationStrategy {
         return shards.acquire(eventId, this::tryRow);
     }
 
-    private RowResult tryRow(long eventId, int shardNo) {
+    private RowResult tryRow(ShardRow row) {
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             VersionedStock current = jdbc.sql("""
                             SELECT qty, version FROM stock WHERE event_id = :eventId AND shard_no = :shardNo
                             """)
-                    .param("eventId", eventId)
-                    .param("shardNo", shardNo)
+                    .param("eventId", row.eventId())
+                    .param("shardNo", row.shardNo())
                     .query((rs, rowNum) -> new VersionedStock(rs.getInt("qty"), rs.getLong("version")))
                     .single();
             if (current.qty() <= 0) {
@@ -95,8 +96,8 @@ public class OptimisticLockingStrategy implements ReservationStrategy {
                             SET qty = qty - 1, version = version + 1
                             WHERE event_id = :eventId AND shard_no = :shardNo AND version = :version
                             """)
-                    .param("eventId", eventId)
-                    .param("shardNo", shardNo)
+                    .param("eventId", row.eventId())
+                    .param("shardNo", row.shardNo())
                     .param("version", current.version())
                     .update();
             if (updated == 1) {

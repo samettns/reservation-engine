@@ -1,6 +1,7 @@
 package io.github.samettns.reservation.strategy;
 
 import io.github.samettns.reservation.strategy.StockShards.RowResult;
+import io.github.samettns.reservation.strategy.StockShards.ShardRow;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
 
@@ -42,15 +43,15 @@ public class PessimisticPrecheckStrategy implements ReservationStrategy {
         return shards.acquire(eventId, this::tryRow);
     }
 
-    private RowResult tryRow(long eventId, int shardNo) {
+    private RowResult tryRow(ShardRow row) {
         int qty = jdbc.sql("SELECT qty FROM stock WHERE event_id = :eventId AND shard_no = :shardNo")
-                .param("eventId", eventId)
-                .param("shardNo", shardNo)
+                .param("eventId", row.eventId())
+                .param("shardNo", row.shardNo())
                 .query(Integer.class)
                 .single();
         if (qty <= 0) {
             return RowResult.EMPTY; // sold out without ever touching the row lock
         }
-        return locked.tryRow(eventId, shardNo);
+        return locked.tryRow(row);
     }
 }

@@ -3,8 +3,6 @@ package io.github.samettns.reservation.strategy;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Component;
 
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
@@ -16,6 +14,12 @@ import java.util.concurrent.ThreadLocalRandom;
  * Random start spreads concurrent requests across rows; visiting every shard before
  * answering "sold out" guarantees we never refuse while another shard still has stock.
  * With one shard this is exactly the old single-row behaviour.
+ *
+ * <p>The shard count is read from the database on every call, NOT cached in memory. An earlier
+ * version cached it per event id as "immutable"; the stage 3 benchmark resets the database with
+ * {@code TRUNCATE ... RESTART IDENTITY}, ids were reused, and the stale cache made 4- and 16-shard
+ * events behave as single-shard ones (only one shard was ever sold). A cache without
+ * invalidation traded correctness for one primary-key lookup; not worth it.
  */
 @Component
 public class StockShards {
@@ -30,14 +34,19 @@ public class StockShards {
         CONTENDED
     }
 
+    /** One stock row to try, plus how many rows the event has in total. */
+    public record ShardRow(long eventId, int shardNo, int shardCount) {
+        public boolean onlyShard() {
+            return shardCount == 1;
+        }
+    }
+
     @FunctionalInterface
     public interface RowAttempt {
-        RowResult tryRow(long eventId, int shardNo);
+        RowResult tryRow(ShardRow row);
     }
 
     private final JdbcClient jdbc;
-    /** Shard count never changes after an event is created, so it can be cached forever. */
-    private final Map<Long, Integer> shardCounts = new ConcurrentHashMap<>();
 
     public StockShards(JdbcClient jdbc) {
         this.jdbc = jdbc;
@@ -52,8 +61,8 @@ public class StockShards {
         int start = shards == 1 ? 0 : ThreadLocalRandom.current().nextInt(shards);
         boolean contended = false;
         for (int i = 0; i < shards; i++) {
-            int shardNo = (start + i) % shards;
-            switch (attempt.tryRow(eventId, shardNo)) {
+            ShardRow row = new ShardRow(eventId, (start + i) % shards, shards);
+            switch (attempt.tryRow(row)) {
                 case ACQUIRED -> {
                     return true;
                 }
@@ -70,18 +79,9 @@ public class StockShards {
     }
 
     public int shardCount(long eventId) {
-        // Deliberately not computeIfAbsent: it holds a lock while computing, and a blocking DB call
-        // inside it would pin the virtual thread to its carrier (Java 21). Two threads may both query
-        // on a cold cache; the value is immutable, so either result is correct.
-        Integer cached = shardCounts.get(eventId);
-        if (cached != null) {
-            return cached;
-        }
-        int count = jdbc.sql("SELECT shard_count FROM events WHERE id = :id")
+        return jdbc.sql("SELECT shard_count FROM events WHERE id = :id")
                 .param("id", eventId)
                 .query(Integer.class)
                 .single();
-        shardCounts.putIfAbsent(eventId, count);
-        return count;
     }
 }

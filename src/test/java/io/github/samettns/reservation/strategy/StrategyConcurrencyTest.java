@@ -110,6 +110,28 @@ class StrategyConcurrencyTest extends IntegrationTest {
         invariant.assertHolds(eventId, 10);
     }
 
+    /**
+     * Regression: the shard count used to be cached in memory per event id. When ids were reused
+     * (the benchmark resets the DB with RESTART IDENTITY) a 16-shard event was treated as
+     * single-shard, and every request got "sold out" after one shard was empty. Here the layout
+     * of the SAME event id changes in the database; the next reservation must see it.
+     */
+    @Test
+    void shardLayoutIsNeverServedFromAStaleCache() {
+        long eventId = events.create("layout-change", 1, 1);
+        ReservationService service = serviceWith("atomic");
+        assertThat(service.reserve(eventId, "first", "event-" + eventId + "-first"))
+                .isInstanceOf(ReservationOutcome.Created.class); // shard 0 is now empty
+
+        jdbc.sql("UPDATE events SET shard_count = 2, total_stock = 2 WHERE id = :id").param("id", eventId).update();
+        jdbc.sql("INSERT INTO stock (event_id, shard_no, qty) VALUES (:id, 1, 1)").param("id", eventId).update();
+
+        assertThat(service.reserve(eventId, "second", "event-" + eventId + "-second"))
+                .as("the unit on the new shard must be found")
+                .isInstanceOf(ReservationOutcome.Created.class);
+        invariant.assertHolds(eventId, 2);
+    }
+
     @Test
     void stockIsSplitAsEvenlyAsPossibleAcrossShards() {
         assertThat(events.shardQuantities(events.create("split", 10, 4))).containsExactly(3, 3, 2, 2);
