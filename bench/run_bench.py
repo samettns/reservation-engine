@@ -147,8 +147,10 @@ def log(msg):
 
 def start_strategy(strategy):
     log(f"starting 3 instances with RESERVATION_STRATEGY={strategy}")
+    # Kafka is not running during benchmarks: relay and consumer off (outbox rows are still written,
+    # so their cost inside the reservation transaction IS measured).
     sh("docker", "compose", "--profile", "bench", "up", "-d", "--wait", "--force-recreate",
-       *APPS, "nginx", env={"RESERVATION_STRATEGY": strategy})
+       *APPS, "nginx", env={"RESERVATION_STRATEGY": strategy, "EVENTS_ENABLED": "false"})
     for base in INSTANCES:
         health = http_json("GET", f"{base}/actuator/health")
         assert health["status"] == "UP", health

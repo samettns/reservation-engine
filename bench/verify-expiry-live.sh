@@ -12,7 +12,7 @@ HOLDS=3000
 docker compose --profile bench build -q
 docker compose stop kafka > /dev/null 2>&1 || true
 docker compose up -d --wait postgres redis > /dev/null 2>&1
-HOLD_TTL=PT3S EXPIRY_INTERVAL=PT0.5S RESERVATION_STRATEGY=atomic \
+HOLD_TTL=PT3S EXPIRY_INTERVAL=PT0.5S RESERVATION_STRATEGY=atomic EVENTS_ENABLED=false \
   docker compose --profile bench up -d --wait --force-recreate app1 app2 app3 nginx > /dev/null 2>&1
 
 docker compose exec -T postgres psql -U reservation -d reservation -q \

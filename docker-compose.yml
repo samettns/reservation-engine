@@ -18,6 +18,9 @@ x-app: &app
     DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
     HOLD_TTL: ${HOLD_TTL:-PT10M}
     EXPIRY_INTERVAL: ${EXPIRY_INTERVAL:-PT1S}
+    KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+    # Benchmarks run without Kafka and set this to false (relay + consumer off; outbox rows are still written).
+    EVENTS_ENABLED: ${EVENTS_ENABLED:-true}
   depends_on:
     postgres:
       condition: service_healthy
