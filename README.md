@@ -307,6 +307,40 @@ Tam tablo: [`docs/benchmarks/sellout-5b/summary.md`](docs/benchmarks/sellout-5b/
   sadece 1.000'i başarılı olduğu için etkisi küçük. Yazma ağırlıklı senaryodaki etkisi final benchmark'ta (Aşama 8)
   ölçülecek.
 
+## Dağıtık kilit, fencing token ve Redis–DB mutabakatı (Aşama 6)
+
+**Neden kilit tek başına yetmez (Redlock eleştirisi).** Kira tabanlı bir kilidin sahibi ölmeden sadece
+**duraklayabilir**: GC duraklaması, yavaş disk, ağ gecikmesi. Kira dolar, başka biri kilidi alır, eski sahip uyanır
+ve hâlâ kilidin kendisinde olduğunu sanarak yazar. Kilit servisi bunu engelleyemez, çünkü eski sahip kilide hiç
+sormadan devam ediyor. Martin Kleppmann'ın Redis'in çok düğümlü kilit algoritması Redlock'a yönelik eleştirisi tam
+olarak bu:
+1. Redlock, doğruluk için sınırlı saat kayması ve sınırlı süreç duraklaması varsayıyor; gerçek sistemler bu
+   varsayımları ihlal eder.
+2. Redlock **fencing token** üretmiyor, yani korunan kaynak eski sahibi tanıyamıyor.
+
+Çözüm: kilidi her alışta kesin olarak artan bir token üretmek ve **korunan kaynağın** her yazmada bu token'ı
+kontrol etmesi. Bu projede kilit sadece verimlilik için var (aynı işi iki instance yapmasın). **Doğruluk fencing'den
+geliyor.** Bu yüzden Redlock değil, tek düğümlü `SET NX PX` + `INCR` yeterli.
+
+Bu projede aynı problem iki kez çıktı ve iki farklı depolamada çözüldü:
+
+| | **Idempotency claim (PostgreSQL)** | **Mutabakat kilidi (Redis)** |
+|---|---|---|
+| Kira | `idempotency_keys.locked_until` | `SET lock:... NX PX 10000` |
+| Token kaynağı | Devralmada `fence_token = fence_token + 1` (aynı upsert ifadesinde) | Kilidi alınca `INCR fence:...` |
+| Korunan yazma | Rezervasyon transaction'ının başı (`SELECT ... FOR UPDATE` + token), `COMPLETED`, key'i bırakma | Redis kapı sayacına yazma |
+| Kontrol nerede | SQL `WHERE fence_token = :token` | Lua script: `GET fence == token` ise `SET` (atomik) |
+| Eski sahip ne yapar | Transaction'ı stoğa dokunmadan geri alınır; yeni sahibin durumunu döner | Yazması reddedilir; sayaç değişmez |
+| Kanıt | Unique constraint kaldırılınca fencing'siz 2 rezervasyon oluştu; 3 mutasyon yakalandı | Eski sahip sayacı 8'den 7'ye çekemedi; 3 mutasyon yakalandı |
+
+**Mutabakat işi.** Redis kapı sayacı, Redis'te düşürülüp DB transaction'ı sonuçlanmadan süreç çökerse DB'den
+düşük kalır: var olan birimler satılamaz. Bu iş her instance'ta zamanlanmış çalışıyor; kilit, her turda yalnızca
+birinin çalışmasını sağlıyor. İş her sayacı DB'deki gerçek kalan stoğa eşitliyor; her yazma fencing'li.
+- Canlı doğrulama (`bash bench/verify-reconciler-live.sh`): 3 container, saniyede bir tur. Redis'e 7 birimlik kayma
+  enjekte edildi (90 → 83). 3 saniye içinde düzeltildi (token 14, tek düzeltme).
+- Bilinen imprecision: DB okunurken uçuşta olan istekler Redis'i düşürmüş ama DB'de henüz commit etmemiş olabilir;
+  sayaç birkaç birim yüksek ayarlanabilir. Bu güvenli, çünkü son sözü DB veriyor ve kendiliğinden düzeliyor.
+
 ## Bilinen sınırlamalar
 
 | Sınırlama | Etki | Çözüm planı |
@@ -315,4 +349,4 @@ Tam tablo: [`docs/benchmarks/sellout-5b/summary.md`](docs/benchmarks/sellout-5b/
 | **Zehirli mesaj partition'ı durdurabilir.** Consumer'da işlenemeyen bir mesaj yeniden denenirken aynı partition'daki sonraki mesajlar bekliyor (geliştirme sırasında bir NULL hatasıyla yaşandı). | Bir hata, bir partition'daki bütün olayları geciktirir. | Aşama 7: dead-letter topic. |
 | **Outbox tablosu büyüyor.** Yayınlanmış satırlar silinmiyor. | Disk kullanımı zamanla artar. | Saklama süresi dolanları silen bir temizlik işi (kapsam dışı, not edildi). |
 | **Shard sayısı etkinlik oluşturulurken sabitleniyor.** | Yayındaki bir etkinliğin shard sayısı değiştirilemez (resharding yok). | Kapsam dışı. |
-| **Redis düşüşü ile DB sonucu arasında çökme.** Redis'ten birim düşüldükten sonra, DB transaction'ı sonuçlanıp telafi (`INCR`) çalışmadan uygulama çökerse, düşülen birim Redis'e hiç iade edilmez. | Redis sayacı DB'den düşük kalır: o birimler satılamaz (undersell). Overselling'e yol açmaz, çünkü son kararı DB veriyor. | Aşama 7: Redis sayacını DB'deki kalan stokla eşitleyen bir mutabakat (reconciliation) işi. |
+| **Redis düşüşü ile DB sonucu arasında çökme.** Redis'ten birim düşüldükten sonra, DB transaction'ı sonuçlanıp telafi (`INCR`) çalışmadan uygulama çökerse, düşülen birim Redis'e hiç iade edilmez. | Redis sayacı bir sonraki mutabakat turuna kadar (varsayılan 30 sn) DB'den düşük kalır: o birimler bu süre boyunca satılamaz. | **Aşama 6'da çözüldü:** fencing'li mutabakat işi. |
