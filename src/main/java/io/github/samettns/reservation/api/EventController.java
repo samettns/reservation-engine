@@ -27,18 +27,25 @@ public class EventController {
         this.events = events;
     }
 
-    public record CreateEventRequest(@NotBlank String name, @Min(0) @Max(10_000_000) int stock) {
+    /** {@code shards} is optional: omitted (null) means a single stock row. */
+    public record CreateEventRequest(@NotBlank String name,
+                                     @Min(0) @Max(10_000_000) int stock,
+                                     @Min(1) @Max(256) Integer shards) {
+        int shardsOrDefault() {
+            return shards == null ? 1 : shards;
+        }
     }
 
-    public record EventCreatedResponse(long id, String name, int stock) {
+    public record EventCreatedResponse(long id, String name, int stock, int shards) {
     }
 
     /** Setup endpoint used by tests and benchmarks to create an event with stock. */
     @PostMapping
     public ResponseEntity<EventCreatedResponse> create(@Valid @RequestBody CreateEventRequest request) {
-        long id = events.create(request.name(), request.stock());
+        int shards = request.shardsOrDefault();
+        long id = events.create(request.name(), request.stock(), shards);
         return ResponseEntity.created(URI.create("/events/" + id + "/stock"))
-                .body(new EventCreatedResponse(id, request.name(), request.stock()));
+                .body(new EventCreatedResponse(id, request.name(), request.stock(), shards));
     }
 
     @GetMapping("/{eventId}/stock")
