@@ -56,12 +56,18 @@ const RETRY_503 = __ENV.RETRY_503 === '1';
 const MAX_ATTEMPTS = parseInt(__ENV.MAX_ATTEMPTS || '10', 10);
 const createdEndToEnd = new Trend('latency_201_e2e', true); // first attempt -> 201, waits included
 const gaveUp = new Counter('gave_up_after_503');
+// One sample per retry SENT (measurement only): with `--out csv` its timestamps show when refused
+// clients come back (bench/measure-retry-herd.sh, thundering herd with / without jitter).
+const retrySent = new Counter('retry_sent');
 
 export default function () {
   const id = `${__VU}-${__ITER}`;
   const started = Date.now();
   let res;
   for (let attempt = 1; ; attempt++) {
+    if (attempt > 1) {
+      retrySent.add(1);
+    }
     res = http.post(
       `${BASE_URL}/events/${EVENT_ID}/reserve`,
       JSON.stringify({ userId: `u-${id}` }),

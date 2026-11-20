@@ -40,6 +40,7 @@ public class ReservationService {
     private final Counter markerShortcut;
     /** Test-only pause point between claiming the key and starting the transaction (simulates a GC pause). */
     private final Runnable afterClaim;
+    private final DbStepLimiter dbStep;
 
     @Autowired
     public ReservationService(ReservationStrategy strategy,
@@ -50,14 +51,24 @@ public class ReservationService {
                               TransactionTemplate tx,
                               @Value("${reservation.hold-ttl:PT10M}") Duration holdTtl,
                               @Value("${reservation.idempotency.lease:PT30S}") Duration idempotencyLease,
-                              MeterRegistry meters) {
-        this(strategy, reservations, events, outbox, idempotency, tx, holdTtl, idempotencyLease, meters, () -> { });
+                              MeterRegistry meters,
+                              DbStepLimiter dbStep) {
+        this(strategy, reservations, events, outbox, idempotency, tx, holdTtl, idempotencyLease, meters, () -> { }, dbStep);
     }
 
     /** Package-private: only tests in this package can inject a pause; production always gets a no-op. */
     ReservationService(ReservationStrategy strategy, ReservationRepository reservations, EventRepository events,
                        ReservationEvents outbox, IdempotencyRepository idempotency, TransactionTemplate tx,
                        Duration holdTtl, Duration idempotencyLease, MeterRegistry meters, Runnable afterClaim) {
+        this(strategy, reservations, events, outbox, idempotency, tx, holdTtl, idempotencyLease, meters, afterClaim,
+                DbStepLimiter.unlimited());
+    }
+
+    ReservationService(ReservationStrategy strategy, ReservationRepository reservations, EventRepository events,
+                       ReservationEvents outbox, IdempotencyRepository idempotency, TransactionTemplate tx,
+                       Duration holdTtl, Duration idempotencyLease, MeterRegistry meters, Runnable afterClaim,
+                       DbStepLimiter dbStep) {
+        this.dbStep = dbStep;
         this.afterClaim = afterClaim;
         this.strategy = strategy;
         this.reservations = reservations;
@@ -75,7 +86,7 @@ public class ReservationService {
     public ReservationService(ReservationStrategy strategy, ReservationRepository reservations, EventRepository events,
                               ReservationEvents outbox, IdempotencyRepository idempotency, TransactionTemplate tx) {
         this(strategy, reservations, events, outbox, idempotency, tx, DEFAULT_HOLD_TTL, DEFAULT_IDEMPOTENCY_LEASE,
-                new SimpleMeterRegistry());
+                new SimpleMeterRegistry(), DbStepLimiter.unlimited());
     }
 
     /**
@@ -90,6 +101,9 @@ public class ReservationService {
      *       COMPLETED. All or nothing.</li>
      *   <li>No side effect (sold out, 503, error): release the key so the client can retry.</li>
      * </ol>
+     *
+     * <p>With {@code load-shedding.mode=db}, steps 2-4 (the expensive part) are limited by
+     * {@link DbStepLimiter}; step 1 never is. A refusal happens before the claim: no side effect.
      */
     public ReservationOutcome reserve(long eventId, String userId, String idempotencyKey) {
         if (strategy.knownSoldOut(eventId)) {
@@ -103,6 +117,19 @@ public class ReservationService {
             return answerWithoutTouchingStock(eventId, userId, idempotencyKey);
         }
 
+        if (!dbStep.tryEnter()) {
+            throw new OverloadedException();
+        }
+        try {
+            return reserveAdmitted(eventId, userId, idempotencyKey, availability);
+        } finally {
+            dbStep.exit();
+        }
+    }
+
+    /** The expensive part (claim + stock transaction); limited by {@link DbStepLimiter} in mode=db. */
+    private ReservationOutcome reserveAdmitted(long eventId, String userId, String idempotencyKey,
+                                               Availability availability) {
         OptionalLong claim = idempotency.claim(userId, idempotencyKey, eventId, idempotencyLease);
         if (claim.isEmpty()) {
             return existingOutcome(eventId, userId, idempotencyKey)

@@ -4,11 +4,17 @@
 #   A. Out of memory: small heap (128 MB), no load shedding, 3,000 users. Expected: the JVM exits
 #      (-XX:+ExitOnOutOfMemoryError), Docker restarts the container (restart: unless-stopped),
 #      and all three instances end up healthy again.
-#   B. Hung instance (no OOM): app2 is frozen with `docker pause` (process exists, answers nothing).
-#      Expected: Docker marks it unhealthy within ~10 s; nginx stops sending it traffic after its
-#      first timeout (passive check), so errors are limited to the requests caught in that window.
+#   B. DEAD instance: app2's JVM is frozen with SIGSTOP (process exists, answers nothing).
+#      Expected: Docker marks it unhealthy; nginx ejects it ("upstream server temporarily
+#      disabled"), so errors are limited to the requests caught in the first timeout window.
+#   C. SLOW instances, nobody dead: 5,000 users, NO load shedding (the most overloaded setup),
+#      clients honouring Retry-After. Expected: nginx ejects nobody (no "temporarily disabled",
+#      no 502 "no live upstreams"). With max_fails=1 and a 2 s connect timeout this failed: healthy
+#      instances were ejected and every request got a 502.
+#   B and C together show the health check tells slow from dead.
 #
-#   bash bench/verify-failfast-live.sh          (~4 min; needs postgres + redis from docker compose)
+#   bash bench/verify-failfast-live.sh          (~5 min; needs postgres + redis from docker compose)
+#   SKIP_A=1 bash bench/verify-failfast-live.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT=bench/results-failfast
@@ -22,10 +28,17 @@ restarts() { docker inspect -f '{{.RestartCount}}' "$(c "$1")"; }
 health() { docker inspect -f '{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$(c "$1")"; }
 status_line() { local s=""; for a in "${APPS[@]}"; do s+="$a=$(health "$a") restarts=$(restarts "$a")  "; done; echo "[$(ts)] $s"; }
 new_event() { curl -s -X POST localhost:8000/events -H 'Content-Type: application/json' -d '{"name":"failfast","stock":10000000}' | sed -E 's/.*"id":([0-9]+).*/\1/'; }
-k6_run() { # vus duration summary-name
+k6_run() { # vus duration summary-name [retry503: 0|1]
   "${K6[@]}" run --quiet -e BASE_URL=http://nginx:80 -e EVENT_ID="$EVENT" -e RUN_ID="ff-$3-$RANDOM" -e MODE=contention \
-    -e VUS="$1" -e DURATION="$2" -e SUMMARY_FILE="/results/$3.json" /scripts/reserve.js > /dev/null 2>&1 || true
+    -e VUS="$1" -e DURATION="$2" -e RETRY_503="${4:-0}" -e SUMMARY_FILE="/results/$3.json" /scripts/reserve.js > /dev/null 2>&1 || true
 }
+# nginx's own record of ejections and of what it saw from the upstreams, since a given unix time
+nginx_events() {
+  docker logs --since "$1" "$(c nginx)" 2>&1 \
+    | grep -oE "upstream server temporarily disabled|no live upstreams|upstream timed out \([0-9]+: [^)]*\) while [a-z ]+|connect\(\) failed" \
+    | sort | uniq -c | sed 's/^/nginx: /'
+}
+disabled_count() { docker logs --since "$1" "$(c nginx)" 2>&1 | grep -c "upstream server temporarily disabled" || true; }
 k6_counts() { python3 - "$OUT/$1.json" <<'EOF'
 import json, sys
 m = json.load(open(sys.argv[1]))["metrics"]
@@ -86,7 +99,19 @@ echo "app2 marked unhealthy after: ${unhealthy_after:-never}s" | tee "$OUT/b-res
 echo "k6 (B, 100 users, 40 s with app2 frozen): $(k6_counts b-load)" | tee -a "$OUT/b-result.txt"
 for _ in $(seq 1 30); do [ "$(health app2)" = "running/healthy" ] && break; sleep 1; done
 echo "[$(ts)] after SIGCONT: app2=$(health app2)" | tee -a "$OUT/b-result.txt"
-grep -E "proxy|upstream" "$OUT/b-nginx.log" > /dev/null 2>&1 || true
-docker logs --since "${paused_at}" "$(c nginx)" 2>&1 | grep -oE "upstream timed out|no live upstreams|connect\(\) failed" \
-  | sort | uniq -c | sed 's/^/nginx: /' | tee -a "$OUT/b-result.txt" || true
+nginx_events "$paused_at" | tee -a "$OUT/b-result.txt" || true
+b_disabled=$(disabled_count "$paused_at")
+[ "$b_disabled" -gt 0 ] && echo "B: PASS (dead instance ejected by nginx: $b_disabled time(s))" \
+                         || echo "B: FAIL (nginx never ejected the frozen instance)"
+
+echo "=== C. overloaded but alive -> nobody ejected"
+SHED_ENABLED=false start_apps
+EVENT=$(new_event)
+c_start=$(date +%s)
+k6_run 5000 30s c-load 1
+echo "k6 (C, 5,000 users, no load shedding, Retry-After honoured): $(k6_counts c-load)" | tee "$OUT/c-result.txt"
+nginx_events "$c_start" | tee -a "$OUT/c-result.txt" || true
+c_disabled=$(disabled_count "$c_start")
+[ "$c_disabled" -eq 0 ] && echo "C: PASS (no instance ejected under overload)" \
+                        || echo "C: FAIL (nginx ejected an alive instance $c_disabled time(s))"
 docker compose --profile bench stop app1 app2 app3 nginx > /dev/null

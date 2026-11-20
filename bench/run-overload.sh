@@ -6,6 +6,9 @@
 #   no-shed   : this tree, load shedding OFF (500 ms pool timeout, pool timeout -> 503)
 #   after-100 : this tree + load shedding, 100 reservation requests in flight per instance
 #   after-20  : this tree + load shedding, 20 in flight per instance (= DB pool size)
+#   http-100  : (second round) limit 100 at the HTTP entry       } same nginx (max_fails=10, 10 s
+#   db-20     : (second round) limit 20 at the DB step only      } connect timeout), Retry-After 1-3 s
+#               VARIANTS="http-100 db-20" SKIP_BEFORE=1 bash bench/run-overload.sh
 #
 # Clients honour 503 + Retry-After (BENCH_RETRY_503=1): wait, then retry the same request, up to
 # 10 attempts. This does not change "before" (it never answers 503). Without it, a closed-model
@@ -61,6 +64,9 @@ for v in $VARIANTS; do
     no-shed)   run_variant no-shed SHED_ENABLED=false ;;
     after-100) run_variant after-100 SHED_MAX_IN_FLIGHT=100 ;;
     after-20)  run_variant after-20 SHED_MAX_IN_FLIGHT=20 ;;
+    # second round (stage 7a): limit at the HTTP entry vs at the DB step (after the sold-out shortcuts)
+    http-100)  run_variant http-100 SHED_MODE=http SHED_MAX_IN_FLIGHT=100 ;;
+    db-20)     run_variant db-20 SHED_MODE=db SHED_MAX_IN_FLIGHT=20 ;;
     *) echo "unknown variant $v"; exit 1 ;;
   esac
 done

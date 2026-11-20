@@ -25,6 +25,9 @@ x-app: &app
     # Load shedding (stage 7a): reservation requests in progress per instance before 503.
     SHED_ENABLED: ${SHED_ENABLED:-true}
     SHED_MAX_IN_FLIGHT: ${SHED_MAX_IN_FLIGHT:-100}
+    SHED_MODE: ${SHED_MODE:-http}
+    RETRY_AFTER_MIN_S: ${RETRY_AFTER_MIN_S:-1}
+    RETRY_AFTER_MAX_S: ${RETRY_AFTER_MAX_S:-3}
     HOLD_TTL: ${HOLD_TTL:-PT10M}
     EXPIRY_INTERVAL: ${EXPIRY_INTERVAL:-PT1S}
     KAFKA_BOOTSTRAP_SERVERS: kafka:19092

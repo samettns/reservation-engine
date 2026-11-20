@@ -50,7 +50,7 @@ class OverloadTest extends FailFastIntegrationTest {
             long tookMs = (System.nanoTime() - start) / 1_000_000;
 
             assertThat(refused.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
-            assertThat(refused.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("1");
+            assertThat(refused.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).as("jittered").isIn("1", "2", "3");
             assertThat(refused.getHeaders().getContentType()).hasToString("application/problem+json");
             assertThat(refused.getBody()).contains(LoadSheddingFilter.OVERLOADED_TYPE.toString());
             assertThat(tookMs).as("refused without queueing").isLessThan(1_000);
@@ -77,7 +77,7 @@ class OverloadTest extends FailFastIntegrationTest {
             long tookMs = (System.nanoTime() - start) / 1_000_000;
 
             assertThat(refused.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
-            assertThat(refused.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("1");
+            assertThat(refused.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).as("jittered").isIn("1", "2", "3");
             assertThat(refused.getBody()).contains(ApiExceptionHandler.DEPENDENCY_UNAVAILABLE_TYPE.toString());
             // Fixed bound on purpose (not derived from the configured timeout): the point is "fast".
             assertThat(tookMs).as("fails fast (pool timeout %d ms), not after the old 5 s", dataSource.getConnectionTimeout())

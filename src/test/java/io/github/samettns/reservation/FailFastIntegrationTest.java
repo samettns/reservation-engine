@@ -12,7 +12,9 @@ import org.springframework.context.annotation.Import;
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {"reservation.expiry.enabled=false", "reservation.events.relay.enabled=false",
-                "reservation.reconciler.enabled=false"})
+                "reservation.reconciler.enabled=false",
+                // OverloadTest checks the HTTP-entry filter; the DB-step mode is tested in DbStepLimiterTest.
+                "reservation.load-shedding.mode=http"})
 @Import({TestcontainersConfiguration.class, StockInvariant.class})
 public abstract class FailFastIntegrationTest {
 }

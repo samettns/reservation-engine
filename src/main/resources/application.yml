@@ -92,10 +92,22 @@ reservation:
     # At most this many reservation requests in progress per instance; more get 503 + Retry-After
     # at once. Rule of thumb: a few times the DB pool size (requests also spend time in Redis/HTTP).
     enabled: ${SHED_ENABLED:true}
+    # http: limit at the HTTP entry (every reservation request); db: limit only the DB step (claim +
+    # stock transaction) after the sold-out shortcuts. See README "Aşama 7a" for the measurement.
+    mode: ${SHED_MODE:http}
     max-in-flight: ${SHED_MAX_IN_FLIGHT:100}
+  retry-after:
+    # Every 503 says "retry after N s" with N random in [min, max] (jitter against thundering herds).
+    min-seconds: ${RETRY_AFTER_MIN_S:1}
+    max-seconds: ${RETRY_AFTER_MAX_S:3}
 
 server:
   shutdown: graceful
+  tomcat:
+    # TCP accept queue (default 100). Under a connection burst a full queue makes the kernel drop new
+    # connections; nginx then times out while CONNECTING and, with its passive health check, marks
+    # a healthy instance as failed. A longer queue lets the app itself answer (load shedding: 503).
+    accept-count: ${TOMCAT_ACCEPT_COUNT:2048}
 
 management:
   endpoints:

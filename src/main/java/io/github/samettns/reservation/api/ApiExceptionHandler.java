@@ -2,6 +2,7 @@ package io.github.samettns.reservation.api;
 
 import io.github.samettns.reservation.domain.EventNotFoundException;
 import io.github.samettns.reservation.domain.IdempotencyKeyReusedException;
+import io.github.samettns.reservation.domain.OverloadedException;
 import io.github.samettns.reservation.domain.ReservationNotFoundException;
 import io.github.samettns.reservation.strategy.ContentionException;
 import io.micrometer.core.instrument.Counter;
@@ -22,11 +23,24 @@ import java.net.URI;
 public class ApiExceptionHandler {
 
     static final URI DEPENDENCY_UNAVAILABLE_TYPE = URI.create("urn:problem-type:dependency-unavailable");
+    static final URI OVERLOADED_TYPE = URI.create("urn:problem-type:overloaded");
 
     private final Counter unavailable;
+    private final RetryAfter retryAfter;
 
-    public ApiExceptionHandler(MeterRegistry meters) {
+    public ApiExceptionHandler(MeterRegistry meters, RetryAfter retryAfter) {
         this.unavailable = Counter.builder("reservation.api.dependency_unavailable").register(meters);
+        this.retryAfter = retryAfter;
+    }
+
+    /** Load shedding at the DB step (mode=db): refused before the claim, so retrying is safe. */
+    @ExceptionHandler(OverloadedException.class)
+    ResponseEntity<ProblemDetail> overloaded(OverloadedException e) {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE, e.getMessage());
+        problem.setType(OVERLOADED_TYPE);
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header(HttpHeaders.RETRY_AFTER, retryAfter.next())
+                .body(problem);
     }
 
     @ExceptionHandler({EventNotFoundException.class, ReservationNotFoundException.class})
@@ -47,7 +61,7 @@ public class ApiExceptionHandler {
     @ExceptionHandler(ContentionException.class)
     ResponseEntity<ProblemDetail> contention(ContentionException e) {
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
-                .header(HttpHeaders.RETRY_AFTER, "1")
+                .header(HttpHeaders.RETRY_AFTER, retryAfter.next())
                 .body(ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE, e.getMessage()));
     }
 
@@ -70,7 +84,7 @@ public class ApiExceptionHandler {
                 "A backing service is temporarily unavailable; retry later");
         problem.setType(DEPENDENCY_UNAVAILABLE_TYPE);
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
-                .header(HttpHeaders.RETRY_AFTER, "1")
+                .header(HttpHeaders.RETRY_AFTER, retryAfter.next())
                 .body(problem);
     }
 }
