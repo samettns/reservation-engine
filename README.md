@@ -417,17 +417,77 @@ olarak tutan tur da DB'yi `t_okuma` anında okuyup Redis'e `t_yazma` anında yaz
   bırakılınca işlendi.
 - Mutasyon kontrolü: 6 mutasyonun hepsi yakalandı.
 
-**5.000 kullanıcı, önce / sonra** (`bash bench/run-overload.sh`, tek koşu, **ön sonuç**). Bu ölçümde k6
-istemcileri `Retry-After`'a uymuyor: reddedilen VU bir sonraki isteği hemen gönderiyor. Tam tablo:
-[`docs/benchmarks/overload/comparison.md`](docs/benchmarks/overload/comparison.md).
+**5.000 kullanıcı: yük atmasız / limit 100 / limit 20** (`bash bench/run-overload.sh`, tek koşu).
+- **Ortak koşullar:** Üç varyant da aynı kodla ve aynı yeni nginx ayarlarıyla koşuldu.
+- **İstemci:** `Retry-After`'a uyuyor: 503 alınca bekleyip aynı key ile tekrar deniyor, en fazla 10 deneme.
+- **Tam tablolar:** [`docs/benchmarks/overload/comparison.md`](docs/benchmarks/overload/comparison.md).
+- `naive` sonuçlara katılmadı: kayıp güncellemeler yüzünden stok sayıları anlamsız.
 
-| Varyant | 500 oranı | Başarılı rezervasyon/sn (contention) | Başarılı p99 (contention) | Başarılı p99 (sellout) | Ölen instance |
+**Önce bir bozucu etken: nginx'in pasif sağlık kontrolü aşırı yükte sağlıklı instance'ları da çıkarıyor.**
+- 5.000 kullanıcıda uygulamaların TCP kabul kuyrukları doluyor; nginx'in yeni bağlantıları 2 sn'de zaman aşımına
+  uğruyor. nginx log'u: "upstream timed out ... while **connecting** to upstream".
+- `max_fails=1` olduğu için tek bir bağlantı hatası, sağlıklı bir instance'ı 10 sn trafikten çıkarıyor. Üçü
+  birden çıkınca her istek anında 502 alıyor; istemci 502'yi tekrar denemiyor.
+- Etkilenen koşular: yük atmasızda 10'da 8, limit 20'de 10'da 4 (atomic ve optimistic), limit 100'de 10'da 0.
+  Limit 20'de daha sık olmasının olası nedeni: daha çok istek reddediliyor ve her reddedilen istemci tam 1 sn
+  sonra tekrar geliyor (`Retry-After: 1`, rastgele sapma yok). Eşzamanlı tekrar dalgaları bağlantı patlaması
+  yaratıyor. Bu bir hipotez; ayrıca ölçülmedi.
+- **Bu yüzden karşılaştırmada sadece 502/504 almayan koşular kullanıldı.** nginx ayarının düzeltilmesi açık iş
+  (aşağıda sınırlamalarda).
+
+Temiz koşularda aynı strateji, iki limit:
+
+| | Limit 100 | Limit 20 |
+|---|---|---|
+| Contention, başarılı rezervasyon/sn (pessimistic / redis) | 220 / 199 | 221 / 239 |
+| Contention, başarılı isteğin p99'u (tek deneme) | 2,2 / 2,6 sn | 1,1 / 1,0 sn |
+| Contention, p99 (ilk denemeden 201'e, beklemeler dahil) | 11,3 / 10,8 sn | 9,4 / 9,5 sn |
+| Contention, 10 denemede vazgeçen istemci (5.000'den) | 8.568 / 8.666 | 12.180 / 10.810 |
+| Sellout, başarılı rezervasyon/sn (pessimistic / redis) | 106 / 122 | **72 / 67** |
+| Sellout, satılmadan kalan stok | 0 / 0 | 0 / 0 |
+| Sellout, vazgeçen istemci | 0 / 0 | 138 / 242 |
+| Toplam 503 (contention, tekrar denemeler dahil) | 114.713 / 113.397 | 136.660 / 127.010 |
+| Ölen ya da yeniden başlayan instance | 0 | 0 |
+
+Yük atmasız varyantta da instance ölmedi; ilk koşudaki OOM, `Retry-After`'a uymayan istemcinin fırtınasıyla
+olmuştu. Ama 10 koşunun 8'inde nginx instance'ları trafikten çıkardı ve contention'da başarılı rezervasyon
+16–69/sn'de kaldı (limitli varyantlarda 196–239). Sonuç: yük atma olmadan aşırı yük, ölmeyen ama trafikten
+çıkarılan instance'lara dönüşüyor.
+
+**Varsayılan limit: 100.** Little yasası (L = X × W: uçuştaki istek = throughput × gecikme) ile gerekçe:
+- **Sıcak satırda throughput limitten bağımsız.** Darboğaz satır kilidi; X ≈ 200–240/sn iki limitte de aynı.
+  - Limit 100 → 3 × 100 = 300 istek uçuşta → W ≈ 300 / 210 ≈ **1,4 sn** ortalama.
+  - Limit 20 → 60 istek uçuşta → W ≈ 60 / 220 ≈ **0,27 sn** ortalama.
+  - Ölçülen p99'lar (2,2–2,6 sn ve 1,0–1,1 sn) bununla uyumlu. Yani contention için limit 20 daha iyi: aynı
+    throughput, yarı gecikme. Fazla limit sadece kuyruk ekliyor.
+- **Sellout'ta isteklerin çoğu ucuz.** "Tükendi" kısayolu bir Redis `GET` ya da bir satır okuması. Bunların
+  throughput'u saniyede binlerce; aynı W hedefi için L ≈ X × W, 20'nin çok üstünde.
+  - Limit 20 bu ucuz istekleri de reddediyor: satış %32–45 yavaşladı (106 → 72, 122 → 67/sn) ve 138–242 istemci
+    vazgeçti.
+- **Tek bir sabit limit iki iş yükünü birden karşılayamıyor.** Projenin ana senaryosu flaş satış ve limit 100'de
+  nginx bozucu etkisi hiç görülmedi; bu yüzden varsayılan 100 kaldı. Contention'da bedeli p99 2,2–2,6 sn
+  (önceki ~13 sn'ye göre yine çok iyi).
+- **Doğru çözüm (önerilen sonraki adım):** Limiti HTTP girişine değil, kıt kaynağın kullanıldığı yere koymak:
+  "tükendi" kısayollarından sonraki DB transaction adımına. O zaman Little yasasına göre ≈ havuz boyutu (20)
+  doğru değer olur ve ucuz cevaplar sınırlanmaz. Alternatifi, gecikmeye göre kendini ayarlayan limit (adaptive
+  concurrency).
+
+**Tarihsel referans: Aşama 6 hali ("önce") ve ilk koşu.** Bunlar kontrollü bir karşılaştırma değil.
+- **"Önce" farklı koşullarda ölçüldü:**
+  - Uygulama: 5 sn havuz beklemesi, 500 dönüyor, yük atma yok.
+  - **nginx:** pasif sağlık kontrolü yok, 60 sn zaman aşımları.
+  - İstemci: `Retry-After` beklemiyor; zaten 503 de almıyordu.
+- **Farkın bir kısmı nginx değişikliğinden geliyor** ve bu ölçümden ayrıştırılamıyor. Örneğin yeni nginx
+  aşırı yükte instance'ları trafikten çıkarabiliyor (yukarıda); eski nginx bunu hiç yapmıyordu.
+- Tablo: [`comparison-first-run-no-retry.md`](docs/benchmarks/overload/comparison-first-run-no-retry.md).
+
+| Varyant (eski nginx, istemci `Retry-After`'a uymuyor) | 500 oranı | Başarılı rezervasyon/sn (contention) | Başarılı p99 (contention) | Başarılı p99 (sellout) | Ölen instance |
 |---|---|---|---|---|---|
-| Önce (5 sn bekleme, 500) | %78–83 contention, %6–60 sellout | 117–149 | 12,7–14,9 sn | 4,5–14,3 sn | yok |
-| Shed'siz (500 ms bekleme, 503) | %0 | **0,9–2,3** | 8,1–16,5 sn | 10,7–12,1 sn | **contention koşusunun hepsinde 1 instance (OOM)** |
-| Sonra (yük atma, limit 100) | %0 | 55–70 | 6,2–7,7 sn | 1,9–2,6 sn | yok |
+| Önce (Aşama 6: 5 sn bekleme, 500) | %78–83 contention, %6–60 sellout | 117–149 | 12,7–14,9 sn | 4,5–14,3 sn | yok |
+| Yük atmasız (500 ms bekleme, 503) | %0 | **0,9–2,3** | 8,1–16,5 sn | 10,7–12,1 sn | **her contention koşusunda 1 instance (OOM)** |
+| Limit 100 | %0 | 55–70 | 6,2–7,7 sn | 1,9–2,6 sn | yok |
 
-Okuma:
+İlk koşudan çıkanlar:
 - **500'ler tamamen kalktı.**
 - **Bekleme süresini kısaltmak tek başına zararlı.**
   - Bekleme 5 sn'den 500 ms'ye inince başarısız istekler 10 kat hızlı geri dönüyor; istemci de aynı hızla yeniden
@@ -444,10 +504,7 @@ Okuma:
      uçuşta, ~60/sn throughput → ~5 sn gecikme (ölçülen p99 6–7 sn).
 - **Sellout'ta stok satılmadan kaldı (1.000 biriminin 396–984'ü, shed'siz ve sonra).** 20.000 isteğin %97'si 503
   aldı ve bu ölçümdeki istemci 503'ten sonra vazgeçiyor. 503 "tükendi" değil, "sonra tekrar dene" demek; tekrar
-  denemeyen istemciyle stok satılamaz. Aşağıdaki tekrar ölçümün asıl nedeni bu.
-- **Sonraki ölçüm (bekliyor):** `Retry-After`'a uyan istemci (bekle, aynı key ile en fazla 10 deneme) ve limit
-  100'e karşı 20 (≈ havuz boyutu). İstemci değişikliği "önce" sütununu etkilemiyor, çünkü o hiç 503 dönmüyor.
-  İlk deneme bellek baskısı nedeniyle yarıda durduruldu.
+  denemeyen istemciyle stok satılamaz. Bu yüzden yukarıdaki asıl ölçüm `Retry-After`'a uyan istemciyle yapıldı.
 
 **"Healthy ama ölü" instance düzeltildi (fail fast, sürecin kendisi için de).**
 
@@ -475,7 +532,8 @@ orkestratörün işi (ör. Kubernetes liveness probe).
 | **Idempotency claim'i her başarılı rezervasyona bir commit ekliyor.** | Yazma ağırlıklı senaryoda throughput'a etkisi henüz ölçülmedi. | Aşama 8 (final benchmark). |
 | **Zehirli mesaj partition'ı durdurabilir.** Consumer'da işlenemeyen bir mesaj yeniden denenirken aynı partition'daki sonraki mesajlar bekliyor (geliştirme sırasında bir NULL hatasıyla yaşandı). | Bir hata, bir partition'daki bütün olayları geciktirir. | **Aşama 7a'da çözüldü:** 3 deneme, sonra dead-letter topic. |
 | **DLT'deki mesajları yeniden yayınlayan bir araç yok.** | Hata düzeltilince mesajlar elle yeniden yayınlanmalı (consumer idempotent olduğu için güvenli). | Kapsam dışı; `reservation.consumer.dead_lettered` sayacı ve ERROR log'u alarm için var. |
-| **Yük atma limiti sabit ve henüz ayarlanmadı.** Sıcak satırda 100 fazla yüksek (bkz. Aşama 7a ölçümü). | Kabul edilen istekler kuyrukta bekliyor; p99 hâlâ saniyeler mertebesinde. | Retry-After'a uyan istemciyle 100 / 20 ölçümü (bekliyor). Sonrası: gecikmeye göre kendini ayarlayan limit (adaptive concurrency). |
+| **Yük atma limiti HTTP girişinde ve sabit.** Sıcak satır için ~20, ucuz "tükendi" cevapları için çok daha yüksek bir limit doğru; tek sayı ikisine uymuyor (Aşama 7a ölçümü). | Varsayılan 100: contention'da p99 2,2–2,6 sn (20 ile 1,0–1,1 sn olurdu). | Limiti DB transaction adımına taşımak (kısayollardan sonra, ≈ havuz boyutu) ya da adaptive concurrency. |
+| **nginx pasif sağlık kontrolü aşırı yükte sağlıklı instance'ları da çıkarıyor.** `max_fails=1` + 2 sn bağlantı zaman aşımı: dolu kabul kuyruğu tek bir bağlantı hatası üretince instance 10 sn çıkıyor; üçü birden çıkınca her istek 502. | 5.000 kullanıcılı ölçümde yük atmasızda 10 koşunun 8'inde, limit 20'de 4'ünde görüldü. | `max_fails`'i yükseltmek, bağlantı zaman aşımını uzatmak, `Retry-After`'a rastgele sapma eklemek (eşzamanlı tekrar dalgalarını dağıtmak için); her biri yeniden ölçülmeli. Aktif sağlık kontrolü (HAProxy/Envoy) asıl çözüm. |
 | **Havuz zaman aşımında claim'in bırakılması da bağlantı alamayabilir.** | Aynı key ile tekrar deneme, claim'in kirası (30 sn) dolana kadar "işlemde" (409) alır. | Not edildi. |
 | **Outbox tablosu büyüyor.** Yayınlanmış satırlar silinmiyor. | Disk kullanımı zamanla artar. | Saklama süresi dolanları silen bir temizlik işi (kapsam dışı, not edildi). |
 | **Shard sayısı etkinlik oluşturulurken sabitleniyor.** | Yayındaki bir etkinliğin shard sayısı değiştirilemez (resharding yok). | Kapsam dışı. |

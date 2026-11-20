@@ -85,6 +85,17 @@ edilen "güvenli yön". Bir sonraki tur sayacı 90'a indirdi.
   - 100 istemcili 40 saniyelik koşuda 8.003 başarılı isteğe karşı 102 zaman aşımı oldu. Bu, pasif sağlık
     kontrolünün bedeli: zaman aşımı penceresinde her istemcinin bir isteği takılıyor.
 
+> **Bu görselin ham çıktısı sonradan filtrelendi.**
+> - **Ne oldu:** Koşu `bash bench/verify-failfast-live.sh | grep -v ' Container '` ile başlatıldı. Docker
+>   Compose'un konteyner ilerleme satırları (`Container reservation-engine-app1-1  Recreate / Starting /
+>   Healthy / Stopping ...`, yaklaşık 110 satır) stderr'e yazıldığı için `grep`'ten kaçtı ve çıktıya karıştı.
+> - **Silinenler:** Sadece içinde ` Container ` geçen satırlar `sed '/ Container /d'` ile silindi; testin kendi
+>   satırlarına dokunulmadı.
+> - **İlk satır:** Bu komut da ` Container ` içerdiği için silinmişti. Yerine, filtrelenmiş çıktıyı doğrudan
+>   üreten komut yazıldı: `... 2>&1 | grep -v ' Container '`.
+> - **Kalıcı düzeltme:** `render.sh` artık bu komutu kullanıyor; bir sonraki üretimde sonradan filtreleme
+>   gerekmeyecek.
+
 ## Mimari
 
 ![mimari](architecture.png)

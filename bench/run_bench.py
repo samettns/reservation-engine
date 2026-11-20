@@ -134,11 +134,28 @@ def sh(*cmd, env=None, check=True, quiet=True):
     return result
 
 
-def http_json(method, url, body=None):
+def http_json(method, url, body=None, patience_s=90):
+    """
+    Control-plane request of the driver (create event, health), NOT part of the measured load.
+    Retried while the system recovers from the previous run: an instance restarting after an OOM,
+    or nginx having marked every instance down for fail_timeout (502 "no live upstreams").
+    """
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+    deadline = time.time() + patience_s
+    while True:
+        req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code not in (502, 503, 504) or time.time() > deadline:
+                raise
+            log(f"   {method} {url}: {e.code}, system still recovering; retrying")
+        except (TimeoutError, OSError) as e:
+            if time.time() > deadline:
+                raise
+            log(f"   {method} {url}: {e}; retrying")
+        time.sleep(2)
 
 
 def log(msg):
