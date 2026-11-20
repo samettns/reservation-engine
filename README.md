@@ -660,7 +660,19 @@ Bu aşamada eklenenler:
   bu, o çağrının kendi işinden **önce** yapılıyor. İşaret varken hiçbir instance sayacın "0"ına güvenmiyor ve
   DB'ye soruyor. İşaret instance'ta değil Redis'te, çünkü bayat sayaç bütün instance'ların ortak sayacı.
 - **Kapının `SOLD_OUT` cevabı DB'ye doğrulatılıyor:** Bayat bir sayaç DB'deki "tükendi" işaretine
-  dönüşemiyor.
+  dönüşemiyor. Bu doğrulama **her zaman** yapılıyor, ama sadece kapıda; asıl "tükendi" kısayolu
+  (`knownSoldOut`) bayatlık işareti yoksa Redis'in 0'ına güvenmeye devam ediyor, 5b'nin faydası korunuyor.
+  - İki ayrı yol var. Kısayol, claim'den önce bir Redis okumasıyla cevap veriyor; sellout'taki isteklerin
+    neredeyse hepsi burada bitiyor. Kapıya sadece kısayolu geçip son birimi kaybeden istekler ulaşıyor.
+  - Kapıda "sadece bayatken doğrula" yeterli değil: sayaç kesinti olmadan da DB'den düşük kalabilir. Örneğin
+    süreç, bir stok iadesinin DB commit'i ile Redis `INCR`'ı arasında ölürse; bunu hiçbir şey bayat diye
+    işaretlemiyor.
+  - Kısayolun yanlış "tükendi"si hiçbir şey yazmıyor ve mutabakatla düzeliyor. Kapının `SOLD_OUT`'u ise DB'deki
+    "tükendi" işaretine yazılıyor; bütün stratejiler bu işarete güveniyor ve mutabakat onu onarmıyor. Kalıcı ve
+    paylaşılan bir yalanın girdisi doğrulanmalı.
+  - Bedeli: kapıya ulaşan nadir istek başına bir kilitsiz DB çağrısı, zaten açık olan transaction'ın içinde.
+    Final benchmark'ta (C) "her zaman" ile "sadece bayatken" ayrı ölçülüyor; kapıya kaç isteğin ulaştığı da
+    kaydediliyor.
 - **Dönüşte hemen mutabakat:** Bir olay tetikleniyor, 30 sn beklenmiyor. İşareti sadece başarılı bir tur
   siliyor (karşılaştır-ve-sil).
 - **Sonuç:** Dönüşten hemen sonraki istek birimi satıyor. Dönüş anında Redis DB'den asla düşük değil; bir

@@ -122,6 +122,9 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
     private final CircuitBreaker breaker;
     private final Counter bypassed;
     private final Counter shortCircuited;
+    private final Counter gateSoldOut;
+    private final Counter gateSoldOutButDbHadStock;
+    private final boolean verifySoldOutAlways;
     /** A Redis call failed or was skipped since the last success: counters may be stale. */
     private volatile boolean countersMayBeStale;
 
@@ -129,7 +132,11 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
     public RedisGateStrategy(StringRedisTemplate redis, JdbcClient jdbc, AtomicUpdateStrategy database,
                              MeterRegistry meters, ApplicationEventPublisher publisher,
                              @Value("${reservation.redis-gate.breaker.failure-threshold:3}") int failureThreshold,
-                             @Value("${reservation.redis-gate.breaker.open-duration:PT2S}") Duration openDuration) {
+                             @Value("${reservation.redis-gate.breaker.open-duration:PT2S}") Duration openDuration,
+                             @Value("${reservation.redis-gate.verify-sold-out:always}") String verifySoldOut) {
+        this.verifySoldOutAlways = !"stale-only".equals(verifySoldOut);
+        this.gateSoldOut = Counter.builder("reservation.redis_gate.sold_out_at_gate").register(meters);
+        this.gateSoldOutButDbHadStock = Counter.builder("reservation.redis_gate.sold_out_but_db_had_stock").register(meters);
         this.redis = redis;
         this.jdbc = jdbc;
         this.database = database;
@@ -183,6 +190,15 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
         return breaker.state();
     }
 
+    /** Is the stale marker set? If Redis cannot say, assume yes (verify against the DB). */
+    private boolean markedStale() {
+        try {
+            return Boolean.TRUE.equals(redisCall(() -> redis.hasKey(STALE_KEY)));
+        } catch (GateUnavailable e) {
+            return true;
+        }
+    }
+
     public static String stockKey(long eventId) {
         return "stock:" + eventId;
     }
@@ -231,12 +247,20 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
             return database.tryAcquireOne(eventId);
         }
         if (result == SOLD_OUT) {
-            // The counter says 0, but a counter can be LOWER than the DB (a return whose INCR was
-            // lost, e.g. during a Redis outage). Never turn that into "sold out" without asking the
-            // DB: the caller would write it into the DB's sold-out marker, which every strategy
-            // trusts. Cheap: requests normally stop at knownSoldOut before getting here.
+            // Reached only by requests that passed knownSoldOut (counter > 0 or marked stale) and
+            // then found 0: race losers. The counter can be LOWER than the DB not only after an
+            // outage (marked stale) but also after a process died between a stock return's DB
+            // commit and its Redis INCR (nothing marks that). The caller writes "sold out" into the
+            // DB's sold-out marker, which every strategy trusts and the reconciler does NOT repair;
+            // so by default (verify-sold-out=always) the DB confirms first. stale-only exists to
+            // measure what that costs (stage 8 benchmark).
+            gateSoldOut.increment();
+            if (!verifySoldOutAlways && !markedStale()) {
+                return OptionalInt.empty();
+            }
             OptionalInt fromDb = database.tryAcquireOne(eventId);
             if (fromDb.isPresent()) {
+                gateSoldOutButDbHadStock.increment();
                 log.warn("Redis gate of event {} said sold out but the DB had stock (stale counter)", eventId);
             }
             return fromDb;

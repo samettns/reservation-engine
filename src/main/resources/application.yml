@@ -110,6 +110,16 @@ reservation:
     # Every 503 says "retry after N s" with N random in [min, max] (jitter against thundering herds).
     min-seconds: ${RETRY_AFTER_MIN_S:1}
     max-seconds: ${RETRY_AFTER_MAX_S:3}
+  # Stage 8 benchmark switches (defaults = the normal behaviour):
+  soldout-shortcuts:
+    # false: no Redis/marker "sold out" shortcut and no marker writes (measures what they bring)
+    enabled: ${SOLDOUT_SHORTCUTS:true}
+  # stock-first: take the stock unit, then insert; stock-last: inserts first, hot stock UPDATE last
+  tx-order: ${TX_ORDER:stock-first}
+  redis-gate:
+    # always: a SOLD_OUT from the gate is confirmed by the DB before it becomes "sold out" (and the
+    # DB's sold-out marker); stale-only: only while the counters are marked stale after an outage.
+    verify-sold-out: ${REDIS_VERIFY_SOLD_OUT:always}
 
 server:
   shutdown: graceful

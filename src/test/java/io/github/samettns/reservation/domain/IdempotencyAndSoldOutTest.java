@@ -190,7 +190,7 @@ class IdempotencyAndSoldOutTest extends IntegrationTest {
 
     private ReservationService service(ReservationStrategy strategy) {
         return new ReservationService(strategy, reservations, events, reservationEvents, idempotency, tx,
-                ReservationService.DEFAULT_HOLD_TTL, LEASE, meters, DbStepLimiter.unlimited());
+                ReservationService.DEFAULT_HOLD_TTL, LEASE, meters, DbStepLimiter.unlimited(), true, "stock-first");
     }
 
     private double shortcuts(String source) {

@@ -28,3 +28,5 @@ bench/results-showcase/
 bench/results-failfast/
 bench/results-memory/
 bench/results-herd/
+bench/results-final/
+bench/results-final-smoke/

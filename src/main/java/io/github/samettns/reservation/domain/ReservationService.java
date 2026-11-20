@@ -41,6 +41,8 @@ public class ReservationService {
     /** Test-only pause point between claiming the key and starting the transaction (simulates a GC pause). */
     private final Runnable afterClaim;
     private final DbStepLimiter dbStep;
+    private final boolean soldOutShortcuts;
+    private final boolean stockLast;
 
     @Autowired
     public ReservationService(ReservationStrategy strategy,
@@ -52,8 +54,11 @@ public class ReservationService {
                               @Value("${reservation.hold-ttl:PT10M}") Duration holdTtl,
                               @Value("${reservation.idempotency.lease:PT30S}") Duration idempotencyLease,
                               MeterRegistry meters,
-                              DbStepLimiter dbStep) {
-        this(strategy, reservations, events, outbox, idempotency, tx, holdTtl, idempotencyLease, meters, () -> { }, dbStep);
+                              DbStepLimiter dbStep,
+                              @Value("${reservation.soldout-shortcuts.enabled:true}") boolean soldOutShortcuts,
+                              @Value("${reservation.tx-order:stock-first}") String txOrder) {
+        this(strategy, reservations, events, outbox, idempotency, tx, holdTtl, idempotencyLease, meters, () -> { }, dbStep,
+                soldOutShortcuts, "stock-last".equals(txOrder));
     }
 
     /** Package-private: only tests in this package can inject a pause; production always gets a no-op. */
@@ -68,6 +73,23 @@ public class ReservationService {
                        ReservationEvents outbox, IdempotencyRepository idempotency, TransactionTemplate tx,
                        Duration holdTtl, Duration idempotencyLease, MeterRegistry meters, Runnable afterClaim,
                        DbStepLimiter dbStep) {
+        this(strategy, reservations, events, outbox, idempotency, tx, holdTtl, idempotencyLease, meters, afterClaim,
+                dbStep, true, false);
+    }
+
+    /**
+     * @param soldOutShortcuts false turns OFF both sold-out shortcuts (strategy and marker) and the
+     *                         writing of the marker: the stage 8 benchmark measures them on/off in
+     *                         the same code.
+     * @param stockLast        true = in the reservation transaction, the inserts first and the hot
+     *                         stock UPDATE last (stage 8 benchmark variant); false = stock first.
+     */
+    ReservationService(ReservationStrategy strategy, ReservationRepository reservations, EventRepository events,
+                       ReservationEvents outbox, IdempotencyRepository idempotency, TransactionTemplate tx,
+                       Duration holdTtl, Duration idempotencyLease, MeterRegistry meters, Runnable afterClaim,
+                       DbStepLimiter dbStep, boolean soldOutShortcuts, boolean stockLast) {
+        this.soldOutShortcuts = soldOutShortcuts;
+        this.stockLast = stockLast;
         this.dbStep = dbStep;
         this.afterClaim = afterClaim;
         this.strategy = strategy;
@@ -86,7 +108,7 @@ public class ReservationService {
     public ReservationService(ReservationStrategy strategy, ReservationRepository reservations, EventRepository events,
                               ReservationEvents outbox, IdempotencyRepository idempotency, TransactionTemplate tx) {
         this(strategy, reservations, events, outbox, idempotency, tx, DEFAULT_HOLD_TTL, DEFAULT_IDEMPOTENCY_LEASE,
-                new SimpleMeterRegistry(), DbStepLimiter.unlimited());
+                new SimpleMeterRegistry(), () -> { }, DbStepLimiter.unlimited(), true, false);
     }
 
     /**
@@ -106,13 +128,13 @@ public class ReservationService {
      * {@link DbStepLimiter}; step 1 never is. A refusal happens before the claim: no side effect.
      */
     public ReservationOutcome reserve(long eventId, String userId, String idempotencyKey) {
-        if (strategy.knownSoldOut(eventId)) {
+        if (soldOutShortcuts && strategy.knownSoldOut(eventId)) {
             redisShortcut.increment();
             return answerWithoutTouchingStock(eventId, userId, idempotencyKey);
         }
         Availability availability = events.findAvailability(eventId)
                 .orElseThrow(() -> new EventNotFoundException(eventId));
-        if (availability.soldOut()) {
+        if (soldOutShortcuts && availability.soldOut()) {
             markerShortcut.increment();
             return answerWithoutTouchingStock(eventId, userId, idempotencyKey);
         }
@@ -125,6 +147,34 @@ public class ReservationService {
         } finally {
             dbStep.exit();
         }
+    }
+
+    /**
+     * Variant "inserts first, hot stock UPDATE last" (stage 8 benchmark, an open item since 5a).
+     * The row lock on the hot stock row is taken as late as possible, so it is held for fewer
+     * statements: UPDATE stock -> (shard fix-up if sharded) -> INSERT outbox -> COMMIT, instead of
+     * UPDATE stock -> INSERT reservation -> INSERT outbox -> UPDATE claim -> COMMIT. (The outbox event
+     * carries the shard, so it can only be written once the UPDATE has picked it.) The price: when
+     * the event is sold out, the reservation insert and the claim update were done in vain and are
+     * rolled back.
+     */
+    private ReservationOutcome stockLastTransaction(org.springframework.transaction.TransactionStatus status,
+                                                    long eventId, String userId, String idempotencyKey,
+                                                    long fenceToken) {
+        Reservation hold = reservations.insertHeld(eventId, 0, userId, idempotencyKey, holdTtl);
+        if (!idempotency.complete(userId, idempotencyKey, hold.id(), fenceToken)) {
+            throw new StaleClaimException(idempotencyKey, fenceToken);
+        }
+        OptionalInt shard = strategy.tryAcquireOne(eventId);              // hot row lock: LAST
+        if (shard.isEmpty()) {
+            status.setRollbackOnly();                                     // undo the inserts above
+            return new ReservationOutcome.SoldOut(eventId);
+        }
+        if (shard.getAsInt() != 0) {
+            hold = reservations.moveToShard(hold.id(), shard.getAsInt());
+        }
+        outbox.held(hold);
+        return new ReservationOutcome.Created(hold);
     }
 
     /** The expensive part (claim + stock transaction); limited by {@link DbStepLimiter} in mode=db. */
@@ -148,10 +198,15 @@ public class ReservationService {
                 if (!idempotency.lockClaim(userId, idempotencyKey, fenceToken)) {
                     throw new StaleClaimException(idempotencyKey, fenceToken);
                 }
+                if (stockLast) {
+                    return stockLastTransaction(status, eventId, userId, idempotencyKey, fenceToken);
+                }
                 OptionalInt shard = strategy.tryAcquireOne(eventId);
                 if (shard.isEmpty()) {
                     // Every shard was empty: remember it, as of the stock version read above.
-                    events.markSoldOut(eventId, availability.stockVersion());
+                    if (soldOutShortcuts) {
+                        events.markSoldOut(eventId, availability.stockVersion());
+                    }
                     return new ReservationOutcome.SoldOut(eventId);
                 }
                 Reservation hold = reservations.insertHeld(eventId, shard.getAsInt(), userId, idempotencyKey, holdTtl);
@@ -163,6 +218,11 @@ public class ReservationService {
                 return new ReservationOutcome.Created(hold);
             });
             created = outcome instanceof ReservationOutcome.Created;
+            if (stockLast && soldOutShortcuts && outcome instanceof ReservationOutcome.SoldOut) {
+                // stock-last rolled its transaction back (the inserts were in vain); the marker is
+                // written on its own, as of the stock version read before the claim.
+                events.markSoldOut(eventId, availability.stockVersion());
+            }
             return outcome;
         } catch (StaleClaimException stale) {
             // Our lease was taken over while we were slow; everything we did was rolled back.

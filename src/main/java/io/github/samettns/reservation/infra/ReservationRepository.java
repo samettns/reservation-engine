@@ -59,6 +59,15 @@ public class ReservationRepository {
                 .single();
     }
 
+    /** For the stock-last variant: the hold was inserted before the strategy picked its shard. */
+    public Reservation moveToShard(UUID id, int shardNo) {
+        return jdbc.sql("UPDATE reservations SET shard_no = :shardNo WHERE id = :id RETURNING *")
+                .param("shardNo", shardNo)
+                .param("id", id)
+                .query(ROW_MAPPER)
+                .single();
+    }
+
     public Optional<Reservation> findByIdempotencyKey(String userId, String idempotencyKey) {
         return jdbc.sql("SELECT * FROM reservations WHERE user_id = :userId AND idempotency_key = :key")
                 .param("userId", userId)

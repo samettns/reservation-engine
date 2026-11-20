@@ -85,6 +85,7 @@ FIELDS = [
     "db_active_avg", "db_lock_wait_pct", "db_io_wait_pct", "db_lwlock_wait_pct",
     "total_stock", "db_reserved", "db_remaining", "oversold", "k6_201_equals_db",
     "unsold_after_sellout", "shards_touched", "unresponsive", "restarts",
+    "gate_sold_out", "gate_sold_out_db_had_stock",
 ] + POOL_FIELDS
 
 
@@ -498,6 +499,10 @@ def run_one(strategy, mode, shards, vus):
         # shows up here instead of as "unresponsive". (Its counters restart from zero, so the
         # server-side metrics of such a row are incomplete.)
         "restarts": restarts,
+        # Stage 8: how often the redis gate's SOLD_OUT path ran (race losers), and how often the DB
+        # had stock after all (stale counter). Shows what "always verify against the DB" costs.
+        "gate_sold_out": int(diff(after, before, "reservation_redis_gate_sold_out_at_gate_total")),
+        "gate_sold_out_db_had_stock": int(diff(after, before, "reservation_redis_gate_sold_out_but_db_had_stock_total")),
         **pool_row,
     }
 
