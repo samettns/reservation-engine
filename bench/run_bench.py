@@ -74,7 +74,7 @@ FIELDS = [
     "hikari_acquire_avg_ms", "hikari_timeouts",
     "db_active_avg", "db_lock_wait_pct", "db_io_wait_pct", "db_lwlock_wait_pct",
     "total_stock", "db_reserved", "db_remaining", "oversold", "k6_201_equals_db",
-    "unsold_after_sellout", "shards_touched", "unresponsive",
+    "unsold_after_sellout", "shards_touched", "unresponsive", "restarts",
 ]
 
 
@@ -169,6 +169,13 @@ def psql_value(sql):
     out = sh("docker", "compose", "exec", "-T", "postgres", "psql", "-U", "reservation", "-d", "reservation",
              "-t", "-A", "-c", sql).stdout.strip()
     return int(out)
+
+
+def restart_count():
+    """Sum of Docker restart counts of the three app containers."""
+    out = sh("docker", "inspect", "-f", "{{.RestartCount}}",
+             *[f"reservation-engine-{a}-1" for a in APPS]).stdout.split()
+    return sum(int(x) for x in out)
 
 
 def stock_snapshot(event_id):
@@ -304,10 +311,14 @@ def run_one(strategy, mode, shards, vus):
     run_id = f"{strategy}-{mode}-s{shards}-{vus}"
 
     before = scrape()
+    restarts_before = restart_count()
     sampler = DbWaitSampler()
     sampler.start()
     summary = run_k6(mode, vus, event_id, run_id, f"{run_id}.json")
     db_active, lock_pct, io_pct, lwlock_pct = sampler.stop()
+    restarts = restart_count() - restarts_before
+    if restarts:
+        log(f"!! {run_id}: {restarts} instance restart(s) during the run (JVM exited, e.g. out of memory)")
     after = scrape()
     snapshot = stock_snapshot(event_id)
     touched = shards_touched(event_id)
@@ -356,6 +367,10 @@ def run_one(strategy, mode, shards, vus):
         "k6_201_equals_db": int(s201) == snapshot["reserved"],
         "unsold_after_sellout": unsold, "shards_touched": touched,
         "unresponsive": " ".join(sorted(b.rsplit(":", 1)[1] for b in UNRESPONSIVE)),
+        # Since stage 7a the JVM exits on OutOfMemoryError and Docker restarts it: a dying instance
+        # shows up here instead of as "unresponsive". (Its counters restart from zero, so the
+        # server-side metrics of such a row are incomplete.)
+        "restarts": restarts,
     }
 
 

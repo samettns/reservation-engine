@@ -28,14 +28,28 @@ def num(r, field):
     return f"{float(v):,.0f}" if v not in ("", None) else "-"
 
 
+def dead(r):
+    parts = []
+    if r.get("unresponsive"):
+        parts.append(f"yanıtsız: {r['unresponsive']}")
+    if r.get("restarts") not in (None, "", "0"):
+        parts.append(f"yeniden başladı: {r['restarts']}")
+    return ", ".join(parts) or "-"
+
+
+def unsold(r):
+    return r["db_remaining"] if r["mode"] == "sellout" else "-"
+
+
 METRICS = [
-    ("500 oranı (yanıtların)", lambda r: pct(r, "status_500")),
-    ("503 oranı (yanıtların; tekrar denemeler dahil)", lambda r: pct(r, "status_503")),
     ("Başarılı rezervasyon / sn", lambda r: r["reserved_per_s"]),
     ("Başarılı isteğin p99'u, ms (tek deneme)", lambda r: num(r, "p99_201_ms")),
-    ("Başarılı isteğin p99'u, ms (ilk denemeden 201'e, beklemeler dahil)", lambda r: num(r, "p99_201_e2e_ms")),
+    ("Başarılı isteğin p99'u, ms (ilk denemeden 201'e, Retry-After beklemeleri dahil)", lambda r: num(r, "p99_201_e2e_ms")),
+    ("Sellout sonunda satılmadan kalan stok (1.000'den)", unsold),
+    ("Toplam 503 sayısı (tekrar denemeler dahil)", lambda r: f"{int(r['status_503']):,}"),
+    ("500 oranı", lambda r: pct(r, "status_500")),
     ("10 denemede vazgeçen istemci", lambda r: r.get("gave_up_after_503") or "0"),
-    ("Yanıt vermez olan instance (OOM)", lambda r: r.get("unresponsive") or "-"),
+    ("Ölen instance (yanıtsız kalan / OOM ile kapanıp yeniden başlayan)", dead),
 ]
 
 
