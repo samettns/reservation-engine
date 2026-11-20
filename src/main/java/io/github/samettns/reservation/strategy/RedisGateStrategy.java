@@ -1,10 +1,14 @@
 package io.github.samettns.reservation.strategy;
 
 import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
-import org.springframework.dao.DataAccessException;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.dao.DataAccessException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -12,8 +16,11 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.OptionalInt;
+import java.util.UUID;
+import java.util.function.Supplier;
 
 /**
  * Redis as an admission gate in front of the database.
@@ -99,17 +106,81 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
             return 1
             """, Long.class);
 
+    /**
+     * Set (by whichever instance notices) when Redis worked again after failures: while Redis was
+     * unreachable the DB kept changing, so counters may be stale - possibly LOWER than the DB (a
+     * stock return whose INCR failed). While this key exists, no instance trusts a counter at 0;
+     * the reconciler deletes it after a successful round. It lives in Redis, not in the instance,
+     * because the stale counters are shared by all instances.
+     */
+    public static final String STALE_KEY = "gate:stale";
+
     private final StringRedisTemplate redis;
     private final JdbcClient jdbc;
     private final AtomicUpdateStrategy database;
+    private final ApplicationEventPublisher publisher;
+    private final CircuitBreaker breaker;
     private final Counter bypassed;
+    private final Counter shortCircuited;
+    /** A Redis call failed or was skipped since the last success: counters may be stale. */
+    private volatile boolean countersMayBeStale;
 
+    @Autowired
     public RedisGateStrategy(StringRedisTemplate redis, JdbcClient jdbc, AtomicUpdateStrategy database,
-                             MeterRegistry meters) {
+                             MeterRegistry meters, ApplicationEventPublisher publisher,
+                             @Value("${reservation.redis-gate.breaker.failure-threshold:3}") int failureThreshold,
+                             @Value("${reservation.redis-gate.breaker.open-duration:PT2S}") Duration openDuration) {
         this.redis = redis;
         this.jdbc = jdbc;
         this.database = database;
+        this.publisher = publisher;
+        this.breaker = new CircuitBreaker(failureThreshold, openDuration);
         this.bypassed = Counter.builder("reservation.redis_gate.bypassed").register(meters);
+        this.shortCircuited = Counter.builder("reservation.redis_gate.short_circuited").register(meters);
+        Gauge.builder("reservation.redis_gate.breaker_open", breaker, b -> b.state() == CircuitBreaker.State.CLOSED ? 0 : 1)
+                .register(meters);
+    }
+
+    /** Thrown inside this class when Redis is unreachable or the breaker is open. */
+    private static final class GateUnavailable extends RuntimeException {
+        GateUnavailable(String message) {
+            super(message, null, false, false);
+        }
+    }
+
+    /**
+     * Every Redis call goes through here: the breaker decides whether to try at all (open: fail at
+     * once, no 500 ms timeout); a failure counts against it and marks the counters as possibly stale;
+     * the first success after that marks them stale in Redis and asks for an immediate reconciliation.
+     */
+    private <T> T redisCall(Supplier<T> call) {
+        if (!breaker.tryAcquirePermission()) {
+            shortCircuited.increment();
+            countersMayBeStale = true;
+            throw new GateUnavailable("circuit open");
+        }
+        T value;
+        try {
+            if (countersMayBeStale) {
+                // FIRST mark the counters stale, THEN do the actual call: otherwise the first read
+                // after the outage would still trust a stale 0 (found by RedisRecoveryTest).
+                redis.opsForValue().set(STALE_KEY, UUID.randomUUID().toString());
+                countersMayBeStale = false;
+                publisher.publishEvent(new RedisGateRecovered());
+                log.info("Redis reachable again; gate counters marked stale until the next reconciliation");
+            }
+            value = call.get();
+        } catch (DataAccessException e) {
+            breaker.onFailure();
+            countersMayBeStale = true;
+            throw new GateUnavailable(e.getMessage());
+        }
+        breaker.onSuccess();
+        return value;
+    }
+
+    public CircuitBreaker.State breakerState() {
+        return breaker.state();
     }
 
     public static String stockKey(long eventId) {
@@ -142,22 +213,33 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
 
         long result;
         try {
-            result = runGate(key);
+            result = redisCall(() -> runGate(key));
             if (result == NOT_INITIALISED) {
-                initialiseFromDatabase(eventId, key);
-                result = runGate(key);
+                // Lazy initialisation. Only the Redis calls go through the breaker: a failing DB read
+                // here (e.g. pool timeout) is not a Redis failure and must not open the circuit.
+                String versionBeforeRead = redisCall(() -> returnsVersion(eventId));
+                int dbQty = dbRemaining(eventId);
+                redisCall(() -> initialiseCounter(eventId, dbQty, versionBeforeRead));
+                result = redisCall(() -> runGate(key));
             }
-        } catch (DataAccessException redisUnavailable) {
+        } catch (GateUnavailable redisUnavailable) {
             // FAIL OPEN (stage 7b): Redis is only a gate in front of the DB, and the DB's atomic
             // UPDATE has the final say, so without Redis the request goes to the DB directly:
             // correct, just without the shortcut. (If the gate's DECR did run but its answer was
             // lost, Redis ends one LOWER than the DB; the reconciler's raise fixes that.)
             bypassed.increment();
-            log.warn("Redis gate unavailable ({}); event {} goes straight to the DB", redisUnavailable.getMessage(), eventId);
             return database.tryAcquireOne(eventId);
         }
         if (result == SOLD_OUT) {
-            return OptionalInt.empty();
+            // The counter says 0, but a counter can be LOWER than the DB (a return whose INCR was
+            // lost, e.g. during a Redis outage). Never turn that into "sold out" without asking the
+            // DB: the caller would write it into the DB's sold-out marker, which every strategy
+            // trusts. Cheap: requests normally stop at knownSoldOut before getting here.
+            OptionalInt fromDb = database.tryAcquireOne(eventId);
+            if (fromDb.isPresent()) {
+                log.warn("Redis gate of event {} said sold out but the DB had stock (stale counter)", eventId);
+            }
+            return fromDb;
         }
         if (result == NOT_INITIALISED) {
             // Initialisation was skipped (a stock return raced it). Nothing was decremented in
@@ -174,9 +256,9 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
                     // Only if the counter still exists: after a Redis restart a plain INCR would
                     // create it with value 1, far below the DB (a false "sold out").
                     try {
-                        redis.execute(INCREMENT_IF_PRESENT, List.of(key), "1");
-                    } catch (DataAccessException e) {
-                        // Redis LOWER than the DB by one (safe for overselling); the reconciler raises it.
+                        redisCall(() -> redis.execute(INCREMENT_IF_PRESENT, List.of(key), "1"));
+                    } catch (GateUnavailable e) {
+                        // Redis LOWER than the DB by one (safe for overselling); marked stale, the reconciler raises it.
                         log.warn("Could not give unit back to the Redis gate of event {}: {}", eventId, e.getMessage());
                     }
                 }
@@ -191,16 +273,21 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
     }
 
     /**
-     * Redis "sold out" shortcut: the gate counter is at 0. One Redis GET, no database access.
-     * Becomes false again by itself when expired holds return units ({@link #onStockReturned}).
-     * A missing counter is not "sold out" (it is initialised from the DB on the normal path).
+     * Redis "sold out" shortcut: the gate counter is at 0. One Redis round trip (MGET of the
+     * counter and the stale marker), no database access. Becomes false again by itself when
+     * expired holds return units ({@link #onStockReturned}). A missing counter is not "sold out"
+     * (it is initialised from the DB on the normal path), and neither is a counter at 0 while
+     * the counters are marked stale after an outage ({@link #STALE_KEY}).
      */
     @Override
     public boolean knownSoldOut(long eventId) {
         try {
-            String value = redis.opsForValue().get(stockKey(eventId));
-            return value != null && Long.parseLong(value) <= 0;
-        } catch (DataAccessException redisUnavailable) {
+            List<String> values = redisCall(() -> redis.opsForValue().multiGet(List.of(stockKey(eventId), STALE_KEY)));
+            if (values == null || values.get(1) != null) {
+                return false; // counters may be stale: a 0 could hide returned units -> ask the DB
+            }
+            return values.get(0) != null && Long.parseLong(values.get(0)) <= 0;
+        } catch (GateUnavailable redisUnavailable) {
             return false; // fail open: "don't know" -> the normal path asks the DB
         }
     }
@@ -220,9 +307,11 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
             @Override
             public void afterCommit() {
                 try {
-                    redis.execute(RETURN_UNITS, List.of(key, returnsVersionKey(eventId)), Integer.toString(units));
-                } catch (DataAccessException e) {
-                    // The DB return is committed; Redis stays lower until the reconciler raises it.
+                    redisCall(() -> redis.execute(RETURN_UNITS, List.of(key, returnsVersionKey(eventId)),
+                            Integer.toString(units)));
+                } catch (GateUnavailable e) {
+                    // The DB return is committed; Redis stays LOWER. Marked stale: the "sold out"
+                    // shortcut is not trusted until the reconciler (triggered on recovery) raises it.
                     log.warn("Could not mirror {} returned unit(s) of event {} into Redis: {}", units, eventId, e.getMessage());
                 }
             }
@@ -242,15 +331,13 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
      *       returns version, read BEFORE the DB, exposes that, and we skip.</li>
      * </ul>
      */
-    private void initialiseFromDatabase(long eventId, String key) {
-        String versionBeforeRead = returnsVersion(eventId);
+    private int dbRemaining(long eventId) {
         // One Redis counter per event, whatever the number of DB shards: the gate only needs
         // the total; the DB step (AtomicUpdateStrategy) picks the shard.
-        int dbQty = jdbc.sql("SELECT COALESCE(SUM(qty), 0) FROM stock WHERE event_id = :eventId")
+        return jdbc.sql("SELECT COALESCE(SUM(qty), 0) FROM stock WHERE event_id = :eventId")
                 .param("eventId", eventId)
                 .query(Integer.class)
                 .single();
-        initialiseCounter(eventId, dbQty, versionBeforeRead);
     }
 
     /** The write half of initialisation. Public so tests can put a stock return between read and write. */

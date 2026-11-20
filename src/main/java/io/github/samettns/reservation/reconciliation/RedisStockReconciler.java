@@ -1,7 +1,9 @@
 package io.github.samettns.reservation.reconciliation;
 
 import io.github.samettns.reservation.reconciliation.RedisLock.Lease;
+import io.github.samettns.reservation.strategy.RedisGateRecovered;
 import io.github.samettns.reservation.strategy.RedisGateStrategy;
+import org.springframework.context.event.EventListener;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
@@ -115,6 +117,48 @@ public class RedisStockReconciler {
         this.returnRaces = Counter.builder("reservation.reconciler.lowering_skipped").register(meters);
     }
 
+    private static final RedisScript<Long> DELETE_IF_EQUAL = RedisScript.of("""
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+            end
+            return 0
+            """, Long.class);
+
+    /**
+     * Redis is back after an outage (some instance noticed): counters may be stale, possibly LOWER
+     * than the DB, and the gate distrusts its "sold out" answers until a round has run. Run one now,
+     * in the background, instead of waiting up to the 30 s interval. Works even when the schedule is
+     * disabled; the lock still allows one round at a time.
+     */
+    @EventListener
+    public void onRedisGateRecovered(RedisGateRecovered event) {
+        // Retried, not fire-and-forget: right after an outage Redis is often still flaky (measured
+        // in the full test suite: the first round timed out while the client was reconnecting, and
+        // its lock release failed too, so the lock blocked the next attempt until its TTL ran out).
+        // One round per second until one succeeds, for up to RECOVERY_ATTEMPTS seconds.
+        Thread.ofVirtual().name("reconcile-after-redis-outage").start(() -> {
+            for (int attempt = 1; attempt <= RECOVERY_ATTEMPTS; attempt++) {
+                try {
+                    if (reconcileOnce()) {
+                        return;
+                    }
+                } catch (RuntimeException e) {
+                    log.debug("Reconciliation after the Redis outage, attempt {}: {}", attempt, e.getMessage());
+                }
+                try {
+                    Thread.sleep(1_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+            log.warn("No reconciliation round succeeded within {} s after the Redis outage; the scheduled round will retry",
+                    RECOVERY_ATTEMPTS);
+        });
+    }
+
+    private static final int RECOVERY_ATTEMPTS = 30;
+
     /** One round. @return false if another instance holds the lock (nothing done). */
     public boolean reconcileOnce() {
         var lease = lock.tryAcquire(LOCK_NAME, lockTtl);
@@ -124,7 +168,13 @@ public class RedisStockReconciler {
         }
         acquired.increment();
         try {
+            // Read the stale marker BEFORE the round: delete it afterwards only if no new outage
+            // replaced it meanwhile (compare-and-delete).
+            String staleToken = redis.opsForValue().get(RedisGateStrategy.STALE_KEY);
             readTargets().forEach((eventId, target) -> write(lease.get(), eventId, target));
+            if (staleToken != null) {
+                redis.execute(DELETE_IF_EQUAL, List.of(RedisGateStrategy.STALE_KEY), staleToken);
+            }
             return true;
         } finally {
             lock.release(lease.get()); // compare-and-delete: never frees someone else's lock

@@ -644,6 +644,40 @@ Bu aşamada eklenenler:
 - **Dört mutasyonun dördü de yakalandı:** Fallback'i kaldırmak, Redis zaman aşımını 60 sn'ye çekmek,
   `max.block.ms`'i 60 sn'ye çekmek ve onayı durum kontrolsüz yapmak.
 
+**Redis'in dönüşü ve devre kesici (Aşama 8).**
+
+*Dönüşteki pencere:*
+- **Sorun:** Redis kesintisi sırasında süresi dolan bir rezervasyon birimi DB'ye geri veriyor, ama Redis'teki
+  `INCR` başarısız oluyor. Redis dönünce sayaç DB'den **düşük** kalıyor.
+- **Ölçülen (`RedisRecoveryTest`, düzeltmeden önce):** Stok 1 iken sayaç 0'dı ve dönüşten hemen sonraki istek
+  `SoldOut` aldı. Pencere mutabakat turuna kadar sürüyordu (varsayılan 30 sn).
+- **Daha kötüsü:** Kısayolu geçen bir istek kapıda `SOLD_OUT` alırsa servis bunu DB'deki "tükendi" işaretine
+  yazıyordu. Bu işareti bütün stratejiler kullanıyor ve sadece bir sonraki stok iadesinde siliniyordu. Yalan
+  söyleyen bir sayaç kalıcı bir yalana dönüşebiliyordu.
+
+*Kapatma:*
+- **Stale işareti:** Redis'e erişilemeyen her çağrıdan sonra, ilk başarılı çağrı Redis'e `gate:stale` yazıyor;
+  bu, o çağrının kendi işinden **önce** yapılıyor. İşaret varken hiçbir instance sayacın "0"ına güvenmiyor ve
+  DB'ye soruyor. İşaret instance'ta değil Redis'te, çünkü bayat sayaç bütün instance'ların ortak sayacı.
+- **Kapının `SOLD_OUT` cevabı DB'ye doğrulatılıyor:** Bayat bir sayaç DB'deki "tükendi" işaretine
+  dönüşemiyor.
+- **Dönüşte hemen mutabakat:** Bir olay tetikleniyor, 30 sn beklenmiyor. İşareti sadece başarılı bir tur
+  siliyor (karşılaştır-ve-sil).
+- **Sonuç:** Dönüşten hemen sonraki istek birimi satıyor. Dönüş anında Redis DB'den asla düşük değil; bir
+  fazla olabilir (güvenli yön), bir sonraki tur düzeltiyor.
+- **Mutasyon kontrolü:** 4 mutasyonun hepsi yakalandı. Bunlardan biri, testin bulduğu sıralama hatası: işareti
+  çağrıdan sonra yazmak.
+
+*Devre kesici* (`CircuitBreaker`, 3 ardışık hata → 2 sn açık → tek deneme isteği):
+
+| Redis'in durumu, 30 ardışık istek | Devre kesici yok | Devre kesici var |
+|---|---|---|
+| Bağlantıyı reddediyor (kapalı) | İlk istek ~540 ms, sonrası ~5 ms (Lettuce zaten hemen pes ediyor) | Aynı |
+| Cevap vermiyor (ağ kara deliği, donmuş süreç) | **Her istek ~1.010 ms** (iki çağrı × 500 ms) | İlk iki istek 1.050 / 513 ms, sonrası **3–6 ms** |
+
+Devre kesicinin değeri "cevap vermeyen" durumda; "kapalı" durumda Lettuce zaten hızlı pes ediyor. Zaman
+monoton saatten (`nanoTime`) okunuyor; duvar saatinin geri atlaması devreyi gereğinden uzun açık tutamaz.
+
 Konteyner öldürme denemesinden iki not:
 - `docker kill` sonrası restart policy çalışmıyor; Docker bunu elle durdurma sayıyor. Kendi kendine çıkan bir
   süreç (OOM testindeki gibi) yeniden başlıyor.
@@ -663,3 +697,17 @@ Konteyner öldürme denemesinden iki not:
 | **Outbox tablosu büyüyor.** Yayınlanmış satırlar silinmiyor. | Disk kullanımı zamanla artar. | Saklama süresi dolanları silen bir temizlik işi (kapsam dışı, not edildi). |
 | **Shard sayısı etkinlik oluşturulurken sabitleniyor.** | Yayındaki bir etkinliğin shard sayısı değiştirilemez (resharding yok). | Kapsam dışı. |
 | **Redis düşüşü ile DB sonucu arasında çökme.** Redis'ten birim düşüldükten sonra, DB transaction'ı sonuçlanıp telafi (`INCR`) çalışmadan uygulama çökerse, düşülen birim Redis'e hiç iade edilmez. | Redis sayacı bir sonraki mutabakat turuna kadar (varsayılan 30 sn) DB'den düşük kalır: o birimler bu süre boyunca satılamaz. | **Aşama 6'da çözüldü:** fencing'li mutabakat işi. |
+
+## Gelecek işler
+
+Ölçümlerin ortaya çıkardığı ama bu projenin kapsamı dışında bırakılan işler:
+
+| İş | Neden |
+|---|---|
+| **"Tükendi" işaretini bağlantı havuzunun dışına almak** (Redis'te ya da instance içinde kısa ömürlü önbellekte), sonra yük atma limitini DB adımına ≈ havuz boyutu (20) olarak taşımak | Aşama 7a: DB adımındaki limit 20 kaybetti, çünkü sınırsız "tükendi" okumaları aynı havuz kuyruğunda bekliyordu (ortalama 64–368, en yüksek 2.184 bekleyen thread). Okuma havuzu kullanmazsa Little yasasının öngördüğü kazanç (contention'da yarı gecikme) sellout'u yavaşlatmadan alınabilir. |
+| **Okumalar için ayrı küçük bir bağlantı havuzu (bulkhead)** | Yukarıdakinin alternatifi: ucuz okumalar pahalı transaction'larla aynı kuyruğu paylaşmaz. |
+| **Kendini ayarlayan eşzamanlılık limiti** (adaptive concurrency: Gradient/Vegas) | Sabit bir limit iş yükleri arasında taşınmıyor: contention için ~20, ucuz cevaplar için yüzler doğru. Limiti ölçülen gecikmeye göre ayarlamak ikisini birden karşılar. |
+| **Aktif sağlık kontrolü ve outlier detection** (HAProxy/Envoy) | nginx'in pasif kontrolü donmuş bir instance'ı ancak istekler zaman aşımına uğrayınca fark ediyor (100 istemcide ~100 takılan istek). 10 sn'lik bağlantı zaman aşımı da bir takas (2 sn, aşırı yükte sağlıklı instance'ları çıkarıyordu). Ayrı yoklama isteği ikisini de çözer. |
+| **Thundering-herd ölçümünde görülen 1 sn periyodikliğin kaynağı** | Jitter'la bozulmadığı için senkron tekrar denemelerden gelmiyor. Aday: saniyede bir çalışan hold süresi süpürücüsü ya da GC; süpürücü aralığı değiştirilerek test edilebilir. |
+| **Yük üreticisini sistemden ayırmak** (k6 ayrı makinede ya da sınırlı CPU ile) | Bütün ölçümlerde k6, nginx ve üç JVM aynı makinede; yük üretici sistemle aynı CPU'yu paylaşıyor. Mutlak sayılar bu yüzden "bu laptop"a özgü; karşılaştırmalar aynı koşullarda. |
+| **DLT'deki mesajları yeniden yayınlama aracı, outbox temizliği, resharding** | Bilinen sınırlamalar tablosunda; işlevsel olarak gerekli ama bu projenin konusu olan eşzamanlılık ve doğruluk sorularına bir şey eklemiyor. |

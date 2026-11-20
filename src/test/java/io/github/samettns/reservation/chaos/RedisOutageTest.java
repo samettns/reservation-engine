@@ -1,5 +1,6 @@
 package io.github.samettns.reservation.chaos;
 
+import eu.rekawek.toxiproxy.model.ToxicDirection;
 import io.github.samettns.reservation.domain.ReservationEvents;
 import io.github.samettns.reservation.domain.ReservationOutcome;
 import io.github.samettns.reservation.domain.ReservationService;
@@ -7,6 +8,8 @@ import io.github.samettns.reservation.infra.EventRepository;
 import io.github.samettns.reservation.infra.IdempotencyRepository;
 import io.github.samettns.reservation.infra.ReservationRepository;
 import io.github.samettns.reservation.reconciliation.RedisStockReconciler;
+import io.github.samettns.reservation.strategy.CircuitBreaker;
+import io.github.samettns.reservation.strategy.RedisGateStrategy;
 import io.github.samettns.reservation.strategy.ReservationStrategy;
 import io.github.samettns.reservation.support.ConcurrentRunner;
 import io.github.samettns.reservation.support.StockInvariant;
@@ -76,6 +79,45 @@ class RedisOutageTest extends ChaosIntegrationTest {
         REDIS_PROXY.enable();
         await(() -> reconciler.reconcileOnce());                         // Redis reachable again
         invariant.assertRedisMatchesDatabase(eventId);                    // stale 19 -> real 0
+    }
+
+    /**
+     * Redis HANGS (accepts the connection, never answers: a network black hole, a frozen process).
+     * That is the expensive kind of outage: a refused connection fails within milliseconds (measured:
+     * Lettuce gives up at once after the first attempt), but a hang costs the full 500 ms timeout
+     * per call, twice per request (sold-out check + gate). The circuit breaker opens after 3
+     * failures in a row and skips Redis at once; every 2 s one probe tries it again.
+     */
+    @Test
+    void circuitBreakerStopsWaitingForAHangingRedis() throws Exception {
+        long eventId = events.create("redis-breaker", 1_000);
+        ReservationService service = redisService();
+        RedisGateStrategy gate = (RedisGateStrategy) strategies.stream()
+                .filter(s -> s.name().equals("redis")).findFirst().orElseThrow();
+        service.reserve(eventId, "warm", "cb-warm-" + eventId);
+
+        REDIS_PROXY.toxics().timeout("hang", ToxicDirection.UPSTREAM, 0);   // data goes nowhere, no answer
+        long[] latencyMs = new long[30];
+        for (int i = 0; i < latencyMs.length; i++) {                     // one after the other
+            long t = System.nanoTime();
+            assertThat(service.reserve(eventId, "u" + i, "cb-" + eventId + "-" + i))
+                    .isInstanceOf(ReservationOutcome.Created.class);
+            latencyMs[i] = (System.nanoTime() - t) / 1_000_000;
+        }
+        long[] sorted = latencyMs.clone();
+        java.util.Arrays.sort(sorted);
+        System.out.printf("[redis hangs, breaker] sequential latencies ms: %s%n", java.util.Arrays.toString(latencyMs));
+
+        assertThat(gate.breakerState()).isNotEqualTo(CircuitBreaker.State.CLOSED);
+        assertThat(sorted[latencyMs.length / 2]).as("median: Redis skipped, no 500 ms wait").isLessThan(200);
+        assertThat(java.util.Arrays.stream(latencyMs).sum()).as("30 requests, not 30 x 1 s").isLessThan(10_000);
+
+        REDIS_PROXY.toxics().get("hang").remove();
+        org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(20)).until(() -> {
+            service.reserve(eventId, "probe", "cb-probe-" + eventId + "-" + System.nanoTime());
+            return gate.breakerState() == CircuitBreaker.State.CLOSED;     // a probe got through
+        });
+        invariant.assertConsistent(eventId);
     }
 
     private ReservationService redisService() {
