@@ -10,6 +10,7 @@ import io.github.samettns.reservation.infra.EventRepository;
 import io.github.samettns.reservation.infra.IdempotencyRepository;
 import io.github.samettns.reservation.infra.ReservationRepository;
 import io.github.samettns.reservation.reconciliation.RedisLock.Lease;
+import io.github.samettns.reservation.reconciliation.RedisStockReconciler.Target;
 import io.github.samettns.reservation.reconciliation.RedisStockReconciler.WriteResult;
 import io.github.samettns.reservation.strategy.RedisGateStrategy;
 import io.github.samettns.reservation.strategy.ReservationStrategy;
@@ -28,6 +29,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -126,8 +128,8 @@ class RedisReconcilerTest extends IntegrationTest {
         }
 
         Lease a = lock.tryAcquire(NAME, Duration.ofMillis(200)).orElseThrow();
-        Map<Long, Long> aRead = reconciler.readTargets();
-        assertThat(aRead.get(eventId)).isEqualTo(7);
+        Map<Long, Target> aRead = reconciler.readTargets();
+        assertThat(aRead.get(eventId).dbRemaining()).isEqualTo(7);
         // ---- A is paused (GC) ----
         expire(willExpire);                              // a unit comes back: DB 8, Redis 8
         assertThat(counter(eventId)).isEqualTo(8);
@@ -146,7 +148,168 @@ class RedisReconcilerTest extends IntegrationTest {
         assertThat(lock.release(b)).isTrue();
     }
 
+    /**
+     * A stale write the returns-version guard does NOT catch: it would RAISE the counter. A reads 7,
+     * is paused, a reservation commits (DB 6, Redis 6), B takes over. A's write of 7 is a raise, which
+     * the version guard allows (raising never creates under-reporting). Only the fencing token stops
+     * it; without fencing Redis would claim 7 while the DB has 6.
+     */
+    @Test
+    void staleLockHolderCannotRaiseTheCounterEither() throws Exception {
+        long eventId = events.create("stale-raise", 10);
+        ReservationService service = redisService();
+        for (int i = 0; i < 3; i++) {
+            service.reserve(eventId, "u" + i, "stale-raise-" + eventId + "-" + i);
+        }
+
+        Lease a = lock.tryAcquire(NAME, Duration.ofMillis(200)).orElseThrow();
+        Target aRead = reconciler.readTargets().get(eventId);
+        assertThat(aRead.dbRemaining()).isEqualTo(7);
+        // ---- A is paused ----
+        service.reserve(eventId, "u3", "stale-raise-" + eventId + "-3"); // DB 6, Redis 6
+        Thread.sleep(300);
+        Lease b = lock.tryAcquire(NAME, Duration.ofSeconds(10)).orElseThrow();
+        assertThat(reconciler.write(b, eventId, reconciler.readTargets().get(eventId))).isEqualTo(WriteResult.UNCHANGED);
+        // ---- A wakes up ----
+        assertThat(reconciler.write(a, eventId, aRead)).isEqualTo(WriteResult.REJECTED_STALE_TOKEN);
+
+        assertThat(counter(eventId)).isEqualTo(6);
+        invariant.assertRedisMatchesDatabase(eventId);
+        assertThat(lock.release(b)).isTrue();
+    }
+
+    // --- races of a LEGITIMATE lock holder with live traffic -------------------
+
+    /**
+     * Under-reporting, the harmful direction. The round holds the lock legitimately. It reads the DB
+     * (0 left), then a hold expires and its unit comes back (DB 1, Redis 1), then the round writes
+     * what it read. An absolute SET would put Redis back to 0: the "sold out" shortcut would refuse
+     * a unit that exists until the next round. The write would LOWER the counter while the returns
+     * version moved, so it is skipped.
+     */
+    @Test
+    void stockReturnDuringARoundIsNotOverwritten() {
+        long eventId = events.create("return-race", 1);
+        ReservationService service = redisService();
+        Reservation hold = ((ReservationOutcome.Created) service.reserve(eventId, "u0", "rr-" + eventId + "-0"))
+                .reservation();
+        assertThat(counter(eventId)).isZero();
+
+        Lease round = lock.tryAcquire(NAME, Duration.ofSeconds(10)).orElseThrow();
+        Target read = reconciler.readTargets().get(eventId);
+        assertThat(read.dbRemaining()).isZero();
+        expire(hold);                                    // between the round's read and write
+        assertThat(counter(eventId)).isEqualTo(1);
+
+        assertThat(reconciler.write(round, eventId, read)).isEqualTo(WriteResult.SKIPPED_RETURN_IN_FLIGHT);
+        assertThat(counter(eventId)).as("the returned unit stays visible").isEqualTo(1);
+        invariant.assertRedisMatchesDatabase(eventId);
+        assertThat(service.reserve(eventId, "u1", "rr-" + eventId + "-1"))
+                .as("not a false 'sold out'").isInstanceOf(ReservationOutcome.Created.class);
+        assertThat(lock.release(round)).isTrue();
+    }
+
+    /**
+     * Over-reporting, the safe direction. A reservation has decremented Redis (2 -> 1) and taken the
+     * unit in its still-open DB transaction when a round runs: the round reads the committed DB value
+     * (2) and raises Redis to 2. After the commit Redis says 2, the DB 1. Nothing can be oversold
+     * (the DB has the final say) and the next round brings Redis down to 1.
+     */
+    @Test
+    void inFlightReservationLeavesTheCounterHighUntilTheNextRound() {
+        long eventId = events.create("in-flight", 2);
+        leaveCounterOneTooHigh(eventId);
+        assertThat(counter(eventId)).isEqualTo(2);
+        assertThat(dbRemaining(eventId)).isEqualTo(1);
+
+        assertThat(reconciler.reconcileOnce()).isTrue();
+
+        assertThat(counter(eventId)).as("lowered: no return raced this round").isEqualTo(1);
+        invariant.assertRedisMatchesDatabase(eventId);
+    }
+
+    /** The same surplus, without a round: requests consume it, and the DB keeps the answers right. */
+    @Test
+    void overReportingIsConsumedByRequestsTheDatabaseTurnsAway() {
+        long eventId = events.create("in-flight-drain", 2);
+        leaveCounterOneTooHigh(eventId);
+        ReservationService service = redisService();
+
+        assertThat(service.reserve(eventId, "u1", "drain-" + eventId + "-1")).isInstanceOf(ReservationOutcome.Created.class);
+        assertThat(service.reserve(eventId, "u2", "drain-" + eventId + "-2"))
+                .as("Redis let it through, the DB refused it").isInstanceOf(ReservationOutcome.SoldOut.class);
+
+        assertThat(dbRemaining(eventId)).isZero();
+        invariant.assertRedisMatchesDatabase(eventId);
+    }
+
+    /**
+     * Lazy initialisation has the same under-reporting race. The counter is missing (e.g. Redis
+     * restarted); initialisation reads the DB (0 left); a hold expires (DB 1) and its INCRBY finds no
+     * counter, so it does nothing. Writing 0 now would make the unit unsellable. The returns version
+     * moved, so initialisation is skipped, and the next request initialises from the DB (1).
+     */
+    @Test
+    void lazyInitialisationIsSkippedWhenAStockReturnRacesIt() {
+        long eventId = events.create("init-race", 1);
+        ReservationService service = redisService();
+        Reservation hold = ((ReservationOutcome.Created) service.reserve(eventId, "u0", "ir-" + eventId + "-0"))
+                .reservation();
+        redis.delete(RedisGateStrategy.stockKey(eventId));          // counter lost
+
+        String versionBeforeRead = redisGate().returnsVersion(eventId);
+        long read = dbRemaining(eventId);                           // 0
+        expire(hold);                                               // DB 1, no counter to increment
+        assertThat(redisGate().initialiseCounter(eventId, read, versionBeforeRead)).isEqualTo(-1);
+        assertThat(redis.hasKey(RedisGateStrategy.stockKey(eventId))).isFalse();
+
+        assertThat(service.reserve(eventId, "u1", "ir-" + eventId + "-1")).isInstanceOf(ReservationOutcome.Created.class);
+        invariant.assertRedisMatchesDatabase(eventId);
+    }
+
+    /**
+     * A rollback compensation after the counter was lost (Redis restart) must not recreate it: a
+     * plain INCR would create "1" for an event with 10 units left, i.e. under-reporting.
+     */
+    @Test
+    void rollbackCompensationDoesNotRecreateALostCounter() {
+        long eventId = events.create("lost-counter", 10);
+        RedisGateStrategy gate = redisGate();
+        try {
+            tx.executeWithoutResult(status -> {
+                gate.tryAcquireOne(eventId);
+                redis.delete(RedisGateStrategy.stockKey(eventId)); // Redis restarted mid-request
+                throw new IllegalStateException("request fails after the gate");
+            });
+        } catch (IllegalStateException expected) {
+            // rolled back: the compensation ran
+        }
+        assertThat(redis.hasKey(RedisGateStrategy.stockKey(eventId))).isFalse();
+        assertThat(dbRemaining(eventId)).isEqualTo(10);
+    }
+
     // --- helpers -------------------------------------------------------------
+
+    /** Event with 2 units: one reservation in flight while a round runs, then committed. Redis 2, DB 1. */
+    private void leaveCounterOneTooHigh(long eventId) {
+        RedisGateStrategy gate = redisGate();
+        tx.executeWithoutResult(status -> {
+            assertThat(gate.tryAcquireOne(eventId)).isPresent();     // Redis 2 -> 1, DB row taken, not committed
+            assertThat(counter(eventId)).isEqualTo(1);
+            // The round on another thread = another connection: it sees the committed DB value, 2.
+            assertThat(CompletableFuture.supplyAsync(reconciler::reconcileOnce).join()).isTrue();
+            assertThat(counter(eventId)).as("raised over the in-flight decrement").isEqualTo(2);
+        });
+    }
+
+    private RedisGateStrategy redisGate() {
+        return (RedisGateStrategy) strategies.stream().filter(s -> s.name().equals("redis")).findFirst().orElseThrow();
+    }
+
+    private long dbRemaining(long eventId) {
+        return jdbc.sql("SELECT COALESCE(SUM(qty), 0) FROM stock WHERE event_id = :id")
+                .param("id", eventId).query(Long.class).single();
+    }
 
     private ReservationService redisService() {
         ReservationStrategy redisGate = strategies.stream().filter(s -> s.name().equals("redis")).findFirst().orElseThrow();

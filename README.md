@@ -338,8 +338,44 @@ düşük kalır: var olan birimler satılamaz. Bu iş her instance'ta zamanlanm�
 birinin çalışmasını sağlıyor. İş her sayacı DB'deki gerçek kalan stoğa eşitliyor; her yazma fencing'li.
 - Canlı doğrulama (`bash bench/verify-reconciler-live.sh`): 3 container, saniyede bir tur. Redis'e 7 birimlik kayma
   enjekte edildi (90 → 83). 3 saniye içinde düzeltildi (token 14, tek düzeltme).
-- Bilinen imprecision: DB okunurken uçuşta olan istekler Redis'i düşürmüş ama DB'de henüz commit etmemiş olabilir;
-  sayaç birkaç birim yüksek ayarlanabilir. Bu güvenli, çünkü son sözü DB veriyor ve kendiliğinden düzeliyor.
+
+**Kilidi meşru olarak tutan turun canlı trafikle yarışı.** Fencing yalnızca eski sahibi durdurur. Kilidi meşru
+olarak tutan tur da DB'yi `t_okuma` anında okuyup Redis'e `t_yazma` anında yazar. Arada diğer instance'lar
+çalışmaya devam eder. Turun yazdığı değer bu aradaki Redis değişikliklerini siler:
+
+| Yarışan işlem | Sıra | Sonuç | Yön |
+|---|---|---|---|
+| Rezervasyon (önce Redis −1, sonra DB commit) | Redis −1 yazmadan önce, DB commit okumadan sonra | Silinen −1 yüzünden Redis, DB'den **yüksek** | Güvenli: son sözü DB veriyor |
+| Rollback telafisi (Redis −1, sonra +1) | −1 yazmadan önce, +1 yazmadan sonra | Redis **yüksek** | Güvenli |
+| Stok iadesi (önce DB commit, sonra Redis +n) | DB commit okumadan sonra, Redis +n yazmadan önce | Silinen +n yüzünden Redis, DB'den **düşük** | **Zararlı:** var olan birimler reddediliyor; sayaç 0'a inerse "tükendi" kısayolu yanlış cevap veriyor |
+
+- **Yüksek gösterme nasıl kapanıyor:** Fazla birim kadar istek kapıdan geçip DB'den "tükendi" alıyor; sayaç bu
+  isteklerle düşüyor. Ya da bir sonraki tur sayacı indiriyor. Kimseye yanlış cevap verilmiyor; tek bedel fazladan
+  DB işi.
+- **Düşük gösterme nasıl kapanıyor:** Kendiliğinden kapanmıyor, çünkü sayacı artıran tek işlemler iade ve
+  rollback. Bir sonraki tura kadar sürüyor (varsayılan 30 sn). O turda da bir iade yarışırsa yeniden oluşabiliyor.
+- **Uygulanan çözüm (tek Lua koşulu ve bir sürüm anahtarı):**
+  - Düşük gösterme ancak sayacı **indiren** bir yazmayla oluşabiliyor.
+  - Her iade, atomik olarak `stock-returns:<id>` sürüm anahtarını artırıyor.
+  - Tur bu sürümü DB'den **önce** okuyor.
+  - Sayacı artıran yazmaya her zaman izin var, çünkü bu yazma düşük göstermeyi yalnızca azaltabilir.
+  - Sayacı indiren yazma yalnızca sürüm değişmemişse yapılıyor. Sürüm değiştiyse yazma atlanıyor ve bir sonraki
+    tur yeniden deniyor.
+  - Aynı yarış lazy initialization'da da vardı (DB okunur, iade sayaç yokken commit eder, eski değer yazılır). Aynı
+    sürüm kontrolüyle kapatıldı.
+  - Rollback telafisi artık sayacı yalnızca varsa artırıyor. Redis yeniden başladıktan sonra düz `INCR`, sayacı `1`
+    değeriyle yeniden yaratıyordu.
+- **Neden mutlak değer yerine fark (delta) uygulanmadı:** Delta da yarışıyor. Redis'i DB'den önce okursak, araya
+  giren ve DB'de commit edilen bir rezervasyon iki kez sayılıyor ve sayaç düşük kalıyor. Redis'i DB'den sonra
+  okursak, aynı pencere iadeler için açılıyor. Sayacın kendisi üzerinde karşılaştır-ve-yaz (CAS) da işe yaramıyor:
+  ABA problemi var (bir iade +1, bir rezervasyon −1 yapınca değer aynı kalıyor), ayrıca sıcak etkinlikte sürekli
+  başarısız oluyor. Sadece iadelerin artırdığı bir sürüm ABA'sız ve sıcak yolda maliyetsiz.
+- Kanıt: `RedisReconcilerTest`, deterministik:
+  - Turun okuması ile yazması arasına bir iade sokuldu. Sayaç 1'de kaldı ve rezervasyon başarılı oldu. Koruma
+    yokken sayaç 0'a iniyor.
+  - Uçuştaki rezervasyon sayacı 1 fazla bıraktı. Bir sonraki tur farkı kapattı; turu beklemeden gelen istekler de
+    farkı tüketti.
+  - 6 mutasyonun hepsi yakalandı.
 
 ## Bilinen sınırlamalar
 

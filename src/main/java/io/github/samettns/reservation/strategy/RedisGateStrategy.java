@@ -21,15 +21,16 @@ import java.util.OptionalInt;
  * 5,000 people chase 100 tickets, ~4,900 are turned away in Redis without ever taking a
  * DB connection or contending for the row lock.
  *
- * <p><b>Source of truth is PostgreSQL.</b> Redis is a cache-like gate that may be <i>lower</i>
- * than the DB (safe: we undersell a little until reconciled) but must never be
- * <i>higher</i> in a way that matters, because the DB UPDATE has the final say anyway.
- * Drift cases:
+ * <p><b>Source of truth is PostgreSQL.</b> Redis is a cache-like gate. HIGHER than the DB is safe
+ * for correctness (the DB UPDATE has the final say; it only costs DB work). LOWER than the DB never
+ * oversells, but is harmful: existing units are refused, and at 0 the "sold out" shortcut answers
+ * wrongly. Every writer that sets the counter from a DB read guards against creating that
+ * direction (see the returns version). Drift cases:
  * <ul>
  *   <li>DB transaction rolls back after Redis was decremented: compensated with INCR in an
  *       after-completion callback.</li>
  *   <li>Process crashes between DECR and commit: the callback never runs, Redis stays one
- *       lower than the DB. Needs a reconciliation job (stage 7).</li>
+ *       lower than the DB. Fixed by the reconciliation job (stage 6).</li>
  *   <li>Redis says yes but the DB says sold out: we trust the DB and log the drift.</li>
  *   <li>Expired holds return stock to the DB: mirrored into Redis after the DB commit
  *       ({@link #onStockReturned}).</li>
@@ -65,6 +66,36 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
             return -1
             """, Long.class);
 
+    /**
+     * Stock RETURN: like {@link #INCREMENT_IF_PRESENT}, and always bumps the event's returns version
+     * (KEYS[2]) in the same atomic step. Writers that set the counter from a DB read (the reconciler,
+     * lazy initialisation) compare that version to detect a return that committed after their read:
+     * overwriting it would hide the returned units (Redis LOWER than the DB).
+     */
+    private static final RedisScript<Long> RETURN_UNITS = RedisScript.of("""
+            redis.call('INCR', KEYS[2])
+            if redis.call('EXISTS', KEYS[1]) == 1 then
+                return redis.call('INCRBY', KEYS[1], ARGV[1])
+            end
+            return -1
+            """, Long.class);
+
+    /**
+     * Lazy initialisation: create the counter from a DB read only if it is still missing AND no stock
+     * return happened since before the read. 1 = created, 0 = someone else created it first,
+     * -1 = a return raced the read (counter left missing; the DB decides this request).
+     */
+    private static final RedisScript<Long> INITIALISE = RedisScript.of("""
+            if redis.call('EXISTS', KEYS[1]) == 1 then
+                return 0
+            end
+            if (redis.call('GET', KEYS[2]) or '0') ~= ARGV[2] then
+                return -1
+            end
+            redis.call('SET', KEYS[1], ARGV[1])
+            return 1
+            """, Long.class);
+
     private final StringRedisTemplate redis;
     private final JdbcClient jdbc;
     private final AtomicUpdateStrategy database;
@@ -77,6 +108,17 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
 
     public static String stockKey(long eventId) {
         return "stock:" + eventId;
+    }
+
+    /** Bumped on every stock return. Deliberately outside the "stock:*" pattern the reconciler scans. */
+    public static String returnsVersionKey(long eventId) {
+        return "stock-returns:" + eventId;
+    }
+
+    /** Current returns version ("0" if none yet). Must be read BEFORE the DB stock it guards. */
+    public String returnsVersion(long eventId) {
+        String v = redis.opsForValue().get(returnsVersionKey(eventId));
+        return v == null ? "0" : v;
     }
 
     @Override
@@ -100,6 +142,11 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
         if (result == SOLD_OUT) {
             return OptionalInt.empty();
         }
+        if (result == NOT_INITIALISED) {
+            // Initialisation was skipped (a stock return raced it). Nothing was decremented in
+            // Redis, so nothing to compensate: the DB decides; the next request initialises.
+            return database.tryAcquireOne(eventId);
+        }
 
         // From here on Redis has been decremented: give the unit back if the DB transaction
         // does not commit (strategy fails below, reservation INSERT fails, duplicate key...).
@@ -107,7 +154,9 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
             @Override
             public void afterCompletion(int status) {
                 if (status != STATUS_COMMITTED) {
-                    redis.opsForValue().increment(key);
+                    // Only if the counter still exists: after a Redis restart a plain INCR would
+                    // create it with value 1, far below the DB (a false "sold out").
+                    redis.execute(INCREMENT_IF_PRESENT, List.of(key), "1");
                 }
             }
         });
@@ -134,9 +183,9 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
      * An expired hold gave units back to the DB: give them back to the gate too, otherwise Redis
      * keeps saying "sold out" while the DB has stock again. Applied only AFTER the DB commit (if
      * the return rolls back, Redis must not change). If the process dies between the commit and
-     * this INCRBY, Redis stays lower than the DB: the safe direction (undersell), fixed by the
-     * reconciliation job planned for stage 7. A missing key is left alone: lazy initialisation
-     * will read the already-returned stock from the DB.
+     * this INCRBY, Redis stays lower than the DB until the next reconciliation round. A missing
+     * key is left alone: lazy initialisation will read the already-returned stock from the DB.
+     * The returns version is bumped either way (see {@link #RETURN_UNITS}).
      */
     @Override
     public void onStockReturned(long eventId, int units) {
@@ -144,7 +193,7 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                redis.execute(INCREMENT_IF_PRESENT, List.of(key), Integer.toString(units));
+                redis.execute(RETURN_UNITS, List.of(key, returnsVersionKey(eventId)), Integer.toString(units));
             }
         });
     }
@@ -154,16 +203,28 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
     }
 
     /**
-     * Lazy initialisation from the DB. SET NX makes it safe when many requests (or
-     * instances) race to initialise: only the first one writes, the rest keep its value.
+     * Lazy initialisation from the DB, safe against two races:
+     * <ul>
+     *   <li>many requests/instances initialising at once: only the first one creates the counter;</li>
+     *   <li>a stock return committing between our DB read and our write: its INCRBY found no counter
+     *       and did nothing, so writing our older, lower read would hide the returned units. The
+     *       returns version, read BEFORE the DB, exposes that, and we skip.</li>
+     * </ul>
      */
     private void initialiseFromDatabase(long eventId, String key) {
+        String versionBeforeRead = returnsVersion(eventId);
         // One Redis counter per event, whatever the number of DB shards: the gate only needs
         // the total; the DB step (AtomicUpdateStrategy) picks the shard.
         int dbQty = jdbc.sql("SELECT COALESCE(SUM(qty), 0) FROM stock WHERE event_id = :eventId")
                 .param("eventId", eventId)
                 .query(Integer.class)
                 .single();
-        redis.opsForValue().setIfAbsent(key, Integer.toString(dbQty));
+        initialiseCounter(eventId, dbQty, versionBeforeRead);
+    }
+
+    /** The write half of initialisation. Public so tests can put a stock return between read and write. */
+    public long initialiseCounter(long eventId, long dbQty, String versionBeforeRead) {
+        return redis.execute(INITIALISE, List.of(stockKey(eventId), returnsVersionKey(eventId)),
+                Long.toString(dbQty), versionBeforeRead);
     }
 }
