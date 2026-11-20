@@ -545,8 +545,18 @@ durduruldu (16 GB makine, boştayken 3 GB boş).
 | k6 (5.000 VU) | 1,36 GB | 1,13 GB |
 
 Önlemler:
-- **WSL sayfa önbelleği:** Her stratejiden önce boşaltılıyor; vmmem 3,0 → 1,2 GB, belleği hemen Windows'a geri
-  veriyor.
+- **WSL'in belleği geri vermesi:** `%USERPROFILE%\.wslconfig` içinde `[experimental] autoMemoryReclaim=gradual`
+  (ve `[wsl2] memory=8GB` üst sınırı). Ölçüm (`bash bench/measure-reclaim.sh`):
+  - Koşu sonrası vmmem 4,9 GB.
+  - Konteynerler durunca 30 sn'de 3,5 GB.
+  - Sayfa önbelleği ~2 dk boşta bekleyip geri veriliyor: 3,5 dk sonra 1,1 GB, 10 dk sonra 0,9 GB (koşudan önceki
+    3,1 GB'ın da altında).
+- **İsteğe bağlı: önbelleği hemen boşaltmak (`BENCH_DROP_CACHES=1`, varsayılan kapalı):**
+  - Ne yapıyor: Her stratejiden önce `sync; echo 3 > /proc/sys/vm/drop_caches` (ölçüm: vmmem 3,0 → 1,2 GB).
+  - Neden privileged: `/proc/sys/vm` bütün konteynerlerin paylaştığı çekirdeğe ait. Normal bir konteyner buraya
+    yazamıyor, bu adım `docker run --privileged` ile çalışıyor.
+  - Neden kapalı: Projeyi klonlayan biri farkında olmadan privileged bir konteyner çalıştırmasın.
+    `autoMemoryReclaim` varken gerek yok.
 - **k6:** `GOGC=50` ve 2 GB sınır.
 - **Konteynerler:** Hepsinde bellek sınırı (uygulama 768 MB, PostgreSQL 1 GB, Redis 256 MB, nginx 384 MB, Kafka
   1,5 GB).
@@ -603,6 +613,42 @@ Bu 102 zaman aşımı pasif kontrolün bedeli: nginx bir instance'ın öldüğü
 uğrayınca anlıyor; o sürede her istemcinin bir isteği takılıyor. Aktif sağlık kontrolü (HAProxy, Envoy, nginx
 Plus) bu bedeli düşürür. Docker "unhealthy" bir konteyneri kendiliğinden yeniden başlatmıyor; bu bir
 orkestratörün işi (ör. Kubernetes liveness probe).
+
+## Hata enjeksiyonu (Aşama 7b)
+
+**Nasıl test edildi:**
+- Uygulama PostgreSQL, Redis ve Kafka'ya sadece Toxiproxy üzerinden ulaşıyor (`src/test/.../chaos/`, kendi
+  Spring context'i, üretim zaman aşımları). Test bir bağlantıyı kesiyor ya da gecikme ekliyor; servislerin
+  kendisi çalışmaya devam ediyor.
+- Kafka için bir adım daha var: broker'ın istemcilere duyurduğu adres de proxy'nin adresi. Yoksa ilk istekten
+  sonra istemci proxy'yi atlayıp doğrudan broker'a bağlanırdı.
+- Her senaryoda invariant (`held + confirmed + remaining = total`) otomatik olarak kontrol ediliyor.
+
+| Senaryo | Sistem ne yapıyor | Ölçülen | Test |
+|---|---|---|---|
+| **Redis kapalı** (redis-gate stratejisi) | **Bekletir, sonra DB'ye düşer.** Her Redis çağrısı 500 ms'de pes ediyor; kapı "fail open" çalışıyor ve istek doğrudan DB'nin atomik UPDATE'ine gidiyor. Hiçbir istek reddedilmiyor. | 50 eşzamanlı istek 727 ms'de cevaplandı; 20 birimlik stokta 20 satış, 0 fazla satış. Redis dönünce eski sayaç mutabakat ile DB'ye eşitlendi. | `RedisOutageTest` |
+| **DB ağı yavaş** (+100 ms gidiş-dönüş) | Bağlantı alabilen istek **bekletilir** (yavaşlar); havuzdan 500 ms içinde bağlantı alamayan **reddedilir** (503 + Retry-After). 500 yok. | 80 istemci: 20 × 201, 60 × 503, 9,7 sn. Ağ düzelince 503 alanlar aynı key ile tekrar denedi; tam 30 satış, fazlası yok. | `DatabaseLatencyTest` |
+| **Kafka bağlantısı kesik** | **Ne reddeder ne bekletir.** Kafka istek yolunda değil; olay rezervasyonla aynı transaction'da outbox'a yazılıyor. Relay 5 sn'de pes ediyor (`max.block.ms`), satırlar yayınlanmamış kalıyor; Kafka dönünce hepsi yayınlanıp tam bir kez işleniyor. | 10 rezervasyon 37 ms'de; relay 5.035 ms'de pes etti; Kafka dönünce 10 olay, 10 bildirim. | `KafkaOutageTest` |
+| **Ödeme sırasında instance ölüyor, commit'ten önce** | Açık transaction bağlantıyla birlikte geri alınıyor. Ödeme sağlayıcısının tekrar denemesi başka bir instance'ta onaylıyor. | Ölümden sonra durum HELD, olay 0; tekrar denemede CONFIRMED, tek olay. | `PaymentCrashTest` |
+| **Ödeme sırasında instance ölüyor, commit'ten sonra** (cevap kayboldu) | Tekrar deneme idempotent: `AlreadyConfirmed`, ikinci onay da ikinci olay da yok. | Tek `ReservationConfirmed`. | `PaymentCrashTest` |
+| **Gerçek konteyner öldürme** (3 instance, nginx) | Ölen instance'ın IP'si cevap vermeyi bırakıyor. nginx'in ona bağlanamayan istekleri 10 sn'lik bağlantı zaman aşımından sonra başka instance'a gidiyor (istek hiç ulaşmadığı için güvenli). | 3.000 onayın %10'u bittiğinde app2'ye SIGKILL. 3.000/3.000 onaylandı, her biri tek olay, invariant tuttu, istemci hiç hata görmedi. 50 istek 10 sn gecikti. | `bash bench/verify-kill-during-payment.sh` |
+
+Bu aşamada eklenenler:
+- **Redis komut zaman aşımı 500 ms.** Lettuce'un varsayılanı 60 sn'ydi; her istek Redis kesintisinde 60 sn
+  beklerdi.
+- **Kafka üreticisi `max.block.ms` 5 sn.** Varsayılan 60 sn'de relay'in transaction'ı ve DB bağlantısı o kadar
+  tutulurdu.
+- **Redis kapısı "fail open".** Kapı sadece bir optimizasyon ve son sözü DB veriyor; bu yüzden Redis yokken
+  reddetmek yerine DB'ye gitmek hem doğru hem daha erişilebilir. Bedeli: kapının DECR'ı çalışıp cevabı
+  kaybolursa Redis bir eksik kalır; mutabakat düzeltir.
+- **Dört mutasyonun dördü de yakalandı:** Fallback'i kaldırmak, Redis zaman aşımını 60 sn'ye çekmek,
+  `max.block.ms`'i 60 sn'ye çekmek ve onayı durum kontrolsüz yapmak.
+
+Konteyner öldürme denemesinden iki not:
+- `docker kill` sonrası restart policy çalışmıyor; Docker bunu elle durdurma sayıyor. Kendi kendine çıkan bir
+  süreç (OOM testindeki gibi) yeniden başlıyor.
+- 10 sn'lik bağlantı zaman aşımı bir takas. 2 sn, aşırı yükte sağlıklı instance'ları çıkarıyordu; 10 sn, ölü
+  instance'a gönderilen isteği 10 sn geciktiriyor. Aktif sağlık kontrolü bu takası ortadan kaldırır.
 
 ## Bilinen sınırlamalar
 

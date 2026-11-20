@@ -168,9 +168,17 @@ class PoolSampler(threading.Thread):
 
 def drop_page_cache():
     """
-    Gives the WSL VM's page cache back to Windows before a strategy's containers start (measured:
-    vmmem 3.0 GB -> 1.2 GB). Needs no sudo: a privileged container shares the VM's kernel.
+    OPT-IN (BENCH_DROP_CACHES=1): gives the page cache of the Docker host / WSL VM back before a
+    strategy's containers start (measured under WSL2: vmmem 3.0 GB -> 1.2 GB).
+
+    It runs a PRIVILEGED container: writing /proc/sys/vm/drop_caches changes the kernel shared by
+    every container on the host, which an unprivileged container may not do. That is why it is off
+    by default: nobody who clones this repository should run a privileged container without
+    asking for it. With WSL's autoMemoryReclaim=gradual (.wslconfig) it is not needed.
     """
+    if os.environ.get("BENCH_DROP_CACHES") != "1":
+        return
+    log("dropping the host page cache (BENCH_DROP_CACHES=1, privileged container)")
     sh("docker", "run", "--rm", "--privileged", "alpine", "sh", "-c", "sync; echo 3 > /proc/sys/vm/drop_caches",
        check=False)
 
