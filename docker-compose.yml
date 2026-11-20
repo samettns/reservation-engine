@@ -13,6 +13,10 @@ x-app: &app
   # The JVM exits on OutOfMemoryError (Dockerfile); this brings the instance back. A manual
   # `docker compose stop` is respected.
   restart: unless-stopped
+  # Memory limits on every container: a runaway component is stopped (and here restarted) instead of
+  # starving the host. Measured peaks at 5,000 users: app ~430 MB (512 MB heap cap), nginx ~200 MB,
+  # PostgreSQL ~200 MB, Redis ~10 MB.
+  mem_limit: 768m
   environment:
     # Override for experiments (bench/verify-failfast-live.sh uses a small heap to force an OOM).
     JAVA_OPTS: ${APP_JAVA_OPTS:--Xms256m -Xmx512m -XX:+ExitOnOutOfMemoryError}
@@ -71,6 +75,7 @@ services:
 
   nginx:
     image: nginx:1.27-alpine
+    mem_limit: 384m
     profiles: ["bench"]
     ports: ["8000:80"]
     volumes:
@@ -84,6 +89,7 @@ services:
 
   postgres:
     image: postgres:17-alpine
+    mem_limit: 1g
     environment:
       POSTGRES_DB: reservation
       POSTGRES_USER: reservation
@@ -100,6 +106,7 @@ services:
 
   redis:
     image: redis:7.4-alpine
+    mem_limit: 256m
     ports:
       - "6379:6379"
     healthcheck:
@@ -113,6 +120,8 @@ services:
   #   localhost:9092  -> for the app running on the host
   kafka:
     image: apache/kafka:3.9.1
+    # The image's JVM heap is 1 GB (KAFKA_HEAP_OPTS -Xmx1G), plus off-heap: 1 GB would kill it.
+    mem_limit: 1536m
     ports:
       - "9092:9092"
     environment:

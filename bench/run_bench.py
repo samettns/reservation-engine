@@ -59,11 +59,21 @@ CONTENTION_STOCK = 10_000_000  # never runs out during a run
 
 # k6 runs in a container on the compose network and hits nginx by service name.
 # Runs as the host user so it can write the summary into bench/results.
+# Memory (stage 7a: three benchmark runs were stopped by the host running low on memory):
+# k6 with 5,000 VUs peaked at ~1.4 GB; GOGC=50 (Go collects garbage earlier) brought it to
+# ~1.2 GB, and a hard 2 GB limit makes k6, not the whole machine, pay if it ever grows further.
 K6_DOCKER = [
     "docker", "run", "--rm", "--network", NETWORK, "--ulimit", "nofile=65535:65535",
+    "--memory", "2g", "-e", "GOGC=50",
     "--user", f"{os.getuid()}:{os.getgid()}",
     "-v", f"{ROOT / 'bench' / 'k6'}:/scripts:ro", "-v", f"{RESULTS}:/results",
     K6_IMAGE,
+]
+
+POOL_FIELDS = [
+    "hikari_pending_avg", "hikari_pending_max", "hikari_active_avg",
+    "pg_busy_avg", "pg_share_soldout_read", "pg_share_claim", "pg_share_reservation_tx",
+    "pg_share_background", "pg_share_other",
 ]
 
 FIELDS = [
@@ -75,7 +85,94 @@ FIELDS = [
     "db_active_avg", "db_lock_wait_pct", "db_io_wait_pct", "db_lwlock_wait_pct",
     "total_stock", "db_reserved", "db_remaining", "oversold", "k6_201_equals_db",
     "unsold_after_sellout", "shards_touched", "unresponsive", "restarts",
-]
+] + POOL_FIELDS
+
+
+class PoolSampler(threading.Thread):
+    """
+    Who uses the DB connections during a run (stage 7a: is the DB-step limit starved by work that
+    runs OUTSIDE it?). Once per second:
+      - Hikari, per instance: threads waiting for a connection (pending) and connections in use.
+      - PostgreSQL: every non-idle session of the app, by what it is doing. A session "idle in
+        transaction" is a connection held inside a transaction between two statements; it is
+        classified by its last statement. (A connection checked out for a single autocommit
+        statement is visible only while that statement runs.)
+    """
+
+    CATEGORY_SQL = """
+        SELECT CASE
+          WHEN query ILIKE '%AS sold_out%' THEN 'soldout_read'
+          WHEN query ILIKE 'INSERT INTO idempotency_keys%' OR query ILIKE 'DELETE FROM idempotency_keys%'
+               OR query ILIKE 'SELECT event_id, status, reservation_id%' THEN 'claim'
+          WHEN query ILIKE '%FROM idempotency_keys%FOR UPDATE%' OR query ILIKE 'UPDATE stock SET qty = qty - 1%'
+               OR query ILIKE 'INSERT INTO reservations%' OR query ILIKE 'INSERT INTO outbox%'
+               OR query ILIKE 'UPDATE idempotency_keys%' OR query ILIKE 'UPDATE events SET sold_out_version%'
+               OR query ILIKE 'SELECT qty%' OR query ILIKE '%FROM stock%FOR UPDATE%' THEN 'reservation_tx'
+          WHEN query ILIKE '%expires_at%' OR query ILIKE '%FROM outbox o%' OR query ILIKE 'UPDATE outbox%'
+               OR query ILIKE 'UPDATE reservations%' OR query ILIKE '%GROUP BY event_id%' THEN 'background'
+          ELSE 'other' END, count(*)
+        FROM pg_stat_activity
+        WHERE datname = 'reservation' AND usename = 'reservation' AND pid <> pg_backend_pid()
+          AND state IN ('active', 'idle in transaction')
+        GROUP BY 1
+    """
+    CATEGORIES = ["soldout_read", "claim", "reservation_tx", "background", "other"]
+    GAUGE = re.compile(r'^hikaricp_connections_(pending|active)\{[^}]*\}\s+([0-9.eE+-]+)$')
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.hikari = []   # (pending summed over instances, active summed)
+        self.pg = []       # {category: count}
+        self._halt = threading.Event()
+
+    def run(self):
+        while not self._halt.wait(1.0):
+            pending = active = 0
+            for base in INSTANCES:
+                try:
+                    with urllib.request.urlopen(f"{base}/actuator/prometheus", timeout=3) as resp:
+                        for line in resp.read().decode().splitlines():
+                            m = self.GAUGE.match(line)
+                            if m:
+                                if m.group(1) == "pending":
+                                    pending += float(m.group(2))
+                                else:
+                                    active += float(m.group(2))
+                except (TimeoutError, OSError):
+                    pass
+            self.hikari.append((pending, active))
+            out = sh("docker", "compose", "exec", "-T", "postgres", "psql", "-U", "reservation", "-d", "reservation",
+                     "-t", "-A", "-F", ",", "-c", self.CATEGORY_SQL, check=False).stdout
+            sample = {}
+            for line in out.strip().splitlines():
+                cat, _, n = line.partition(",")
+                if n.strip().isdigit():
+                    sample[cat] = int(n)
+            self.pg.append(sample)
+
+    def stop(self):
+        self._halt.set()
+        self.join()
+        row = {f: "" for f in POOL_FIELDS}
+        if self.hikari:
+            row["hikari_pending_avg"] = round(sum(p for p, _ in self.hikari) / len(self.hikari), 1)
+            row["hikari_pending_max"] = int(max(p for p, _ in self.hikari))
+            row["hikari_active_avg"] = round(sum(a for _, a in self.hikari) / len(self.hikari), 1)
+        total = sum(sum(s.values()) for s in self.pg)
+        if total:
+            row["pg_busy_avg"] = round(total / len(self.pg), 1)
+            for c in self.CATEGORIES:
+                row[f"pg_share_{c}"] = round(100 * sum(s.get(c, 0) for s in self.pg) / total, 1)
+        return row
+
+
+def drop_page_cache():
+    """
+    Gives the WSL VM's page cache back to Windows before a strategy's containers start (measured:
+    vmmem 3.0 GB -> 1.2 GB). Needs no sudo: a privileged container shares the VM's kernel.
+    """
+    sh("docker", "run", "--rm", "--privileged", "alpine", "sh", "-c", "sync; echo 3 > /proc/sys/vm/drop_caches",
+       check=False)
 
 
 class DbWaitSampler(threading.Thread):
@@ -164,6 +261,7 @@ def log(msg):
 
 def start_strategy(strategy):
     log(f"starting 3 instances with RESERVATION_STRATEGY={strategy}")
+    drop_page_cache()
     # Kafka is not running during benchmarks: relay and consumer off (outbox rows are still written,
     # so their cost inside the reservation transaction IS measured).
     sh("docker", "compose", "--profile", "bench", "up", "-d", "--wait", "--force-recreate",
@@ -331,8 +429,12 @@ def run_one(strategy, mode, shards, vus):
     restarts_before = restart_count()
     sampler = DbWaitSampler()
     sampler.start()
+    pool = PoolSampler() if os.environ.get("BENCH_POOL_SAMPLE") == "1" else None
+    if pool:
+        pool.start()
     summary = run_k6(mode, vus, event_id, run_id, f"{run_id}.json")
     db_active, lock_pct, io_pct, lwlock_pct = sampler.stop()
+    pool_row = pool.stop() if pool else {}
     restarts = restart_count() - restarts_before
     if restarts:
         log(f"!! {run_id}: {restarts} instance restart(s) during the run (JVM exited, e.g. out of memory)")
@@ -388,6 +490,7 @@ def run_one(strategy, mode, shards, vus):
         # shows up here instead of as "unresponsive". (Its counters restart from zero, so the
         # server-side metrics of such a row are incomplete.)
         "restarts": restarts,
+        **pool_row,
     }
 
 

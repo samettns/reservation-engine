@@ -1,0 +1,5 @@
+retries in steady window: 74079  per 100 ms: mean 205, max 399, min 2
+peak/mean = 1.95   coefficient of variation = 0.42   busiest 10% of buckets carry 16% of retries
+first 6 s, 100 ms buckets: ▄▅▄▅▅▄▃▃▅▅▄▅▄▆▆▄▃▄▄▆▄▅▄▆▆▅▃▄▅▆▄▅▄▆▆▄▃▄▅▆▄▆▄▆▆▄▃▄▄▆▄▅▃▆▆▄▃▄▅▆
+autocorrelation at lag 0.5 s / 1 s / 2 s / 3 s: +0.58 / +0.84 / +0.73 / +0.64
+first 6 s after the first retry, 250 ms buckets: 378 484 311 404 474 693 393 564 653 868 510 699 498 653 404 585 549 755 453 596 527 759 485 635

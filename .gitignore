@@ -26,3 +26,5 @@ bench/results-*/
 bench/results-overload/
 bench/results-showcase/
 bench/results-failfast/
+bench/results-memory/
+bench/results-herd/
