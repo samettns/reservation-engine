@@ -1,0 +1,14 @@
+$ ./mvnw -B -ntp verify
+  ...
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 20.28 s -- in messaging.DeadLetterTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 32.64 s -- in messaging.OutboxTest
+[INFO] Tests run: 42, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 9.172 s -- in strategy.StrategyConcurrencyTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.768 s -- in api.OverloadTest
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.346 s -- in api.ReservationApiTest
+[INFO] Tests run: 10, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.214 s -- in reconciliation.RedisReconcilerTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 8.867 s -- in domain.HoldExpiryTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.099 s -- in domain.IdempotencyAndSoldOutTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.058 s -- in domain.ClaimFencingTest
+
+[INFO] Tests run: 97, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS

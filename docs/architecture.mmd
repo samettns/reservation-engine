@@ -1,0 +1,40 @@
+%% Architecture of the reservation engine (rendered to docs/showcase/architecture.png by bench/showcase/render.sh)
+flowchart LR
+    client([Clients / k6]) --> nginx[nginx<br/>round robin<br/>passive health checks]
+    nginx --> app1 & app2 & app3
+
+    subgraph apps [3 instances]
+        app1[app1]
+        app2[app2]
+        app3[app3]
+    end
+
+    subgraph inside [inside every instance]
+        shed[LoadSheddingFilter<br/>max in flight -> 503]
+        svc[ReservationService<br/>idempotency claim + fence token]
+        strat[Strategy<br/>naive / atomic / optimistic /<br/>pessimistic / redis gate]
+        sweeper[HoldExpirySweeper<br/>SKIP LOCKED]
+        relay[OutboxRelay<br/>SKIP LOCKED, per-key order]
+        recon[RedisStockReconciler<br/>Redis lock + fenced Lua write]
+        consumer[NotificationConsumer<br/>inbox dedup, retry, DLT]
+        shed --> svc --> strat
+    end
+
+    apps -.-> inside
+
+    pg[(PostgreSQL<br/>stock shards, reservations,<br/>idempotency_keys, outbox, inbox)]
+    redis[(Redis<br/>gate counters, lock, fence)]
+    kafka[[Kafka<br/>reservation-events<br/>reservation-events.DLT]]
+
+    strat --> pg
+    strat -- redis strategy --> redis
+    svc --> pg
+    sweeper --> pg
+    sweeper -- returned units --> redis
+    relay --> pg
+    relay --> kafka
+    kafka --> consumer
+    consumer --> pg
+    consumer -- poison --> kafka
+    recon --> redis
+    recon -- read real stock --> pg

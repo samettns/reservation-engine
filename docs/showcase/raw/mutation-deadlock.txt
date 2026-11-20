@@ -1,0 +1,12 @@
+$ bash bench/showcase/mutation-deadlock.sh
+
+== MUTATION: ROLLBACK TO SAVEPOINT removed (empty shard's row lock is kept)
+  applied: 1 line
+  exit code: 1  (tests RED)
+  'deadlock detected' in log: 352
+  [pessimistic stock=100 shards=8] created=100 replayed=0 soldOut=1 inProgress=0 contended=0 errors=899
+  [ERROR] Tests run: 20, Failures: 2, Errors: 0, Skipped: 0
+== FIX RESTORED
+  exit code: 0  (tests GREEN)
+  'deadlock detected' in log: 0
+  [pessimistic stock=100 shards=8] created=100 replayed=0 soldOut=900 inProgress=0 contended=0 errors=0

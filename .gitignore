@@ -24,3 +24,5 @@ notes/
 bench/results/
 bench/results-*/
 bench/results-overload/
+bench/results-showcase/
+bench/results-failfast/

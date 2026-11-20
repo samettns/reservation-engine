@@ -5,6 +5,15 @@ Yüksek eşzamanlılık altında sınırlı stoğu satan (konser bileti, flaş i
 
 > 🚧 Geliştirme aşamasında. Tam README (mimari, benchmark grafikleri, trade-off'lar) son aşamada eklenecek.
 
+**Gerçek koşulardan görseller** (hepsi ve açıklamaları: [`docs/showcase/`](docs/showcase/README.md)):
+
+| | |
+|---|---|
+| **API akışı:** `201` → aynı key ile `200` + `Idempotent-Replayed` → `409` tükendi → `200` onay → süresi dolmuş tutuma `410` | **Overselling:** 100 bilet için 1.000 eşzamanlı istek. `naive` 243 sattı, `atomic` tam 100 |
+| ![API akışı](docs/showcase/api-flow.gif) | ![naive ve atomic](docs/showcase/oversell.png) |
+| **Fail fast:** OOM'da JVM çıkıyor ve yeniden başlıyor; donmuş instance 13 sn'de "unhealthy" oluyor, nginx onu trafikten çıkarıyor | **Mimari** |
+| ![fail fast](docs/showcase/failfast.png) | ![mimari](docs/showcase/architecture.png) |
+
 ## Hızlı başlangıç
 
 Gereksinimler: Java 21, Docker (Compose v2).
@@ -439,6 +448,25 @@ Okuma:
 - **Sonraki ölçüm (bekliyor):** `Retry-After`'a uyan istemci (bekle, aynı key ile en fazla 10 deneme) ve limit
   100'e karşı 20 (≈ havuz boyutu). İstemci değişikliği "önce" sütununu etkilemiyor, çünkü o hiç 503 dönmüyor.
   İlk deneme bellek baskısı nedeniyle yarıda durduruldu.
+
+**"Healthy ama ölü" instance düzeltildi (fail fast, sürecin kendisi için de).**
+
+| Önce | Şimdi |
+|---|---|
+| OOM sonrası JVM yaşamaya devam ediyordu; Tomcat'in Acceptor thread'i ölmüştü | `-XX:+ExitOnOutOfMemoryError`: süreç kapanıyor; `restart: unless-stopped` temiz bir instance başlatıyor |
+| Healthcheck `/actuator/health` (DB dahil), 30 başarısızlık = 90 sn sonra "unhealthy" | `/actuator/health/liveness` (DB'siz: aşırı yüklü ama çalışan instance ölü sayılmıyor), 2 sn timeout, 3 başarısızlık |
+| nginx `proxy_next_upstream off`: hiçbir hata sayılmıyordu, ölü instance trafik almaya devam ediyordu | Pasif sağlık kontrolü: `max_fails=1 fail_timeout=10s`, paylaşılan `zone`, `proxy_read_timeout 15s`. Ulaşmış bir POST yine hiç yeniden gönderilmiyor |
+
+Canlı deneme (`bash bench/verify-failfast-live.sh`):
+- **128 MB heap ve 3.000 kullanıcı:** üç instance da OOM ile kapandı ve yeniden başladı (5 yeniden başlatma),
+  sonunda hepsi sağlıklı.
+- **app2'nin JVM'i `SIGSTOP` ile donduruldu:** 13 sn'de "unhealthy" oldu. 100 istemcili 40 sn'lik koşuda 102
+  zaman aşımı oldu (8.003 başarılıya karşı).
+
+Bu 102 zaman aşımı pasif kontrolün bedeli: nginx bir instance'ın öldüğünü ancak bir istek zaman aşımına
+uğrayınca anlıyor; o sürede her istemcinin bir isteği takılıyor. Aktif sağlık kontrolü (HAProxy, Envoy, nginx
+Plus) bu bedeli düşürür. Docker "unhealthy" bir konteyneri kendiliğinden yeniden başlatmıyor; bu bir
+orkestratörün işi (ör. Kubernetes liveness probe).
 
 ## Bilinen sınırlamalar
 

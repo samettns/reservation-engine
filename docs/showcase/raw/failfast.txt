@@ -1,0 +1,17 @@
+$ bash bench/verify-failfast-live.sh 2>&1 | grep -v ' Container '
+
+=== A. out of memory -> exit -> restart
+[12:45:46] app1=running/healthy restarts=0  app2=running/healthy restarts=0  app3=running/healthy restarts=0  
+k6 (A): 201=225 503=11063 500=0 other(502/504/timeout)=390221
+[12:46:39] app1=running/healthy restarts=2  app2=running/healthy restarts=2  app3=running/healthy restarts=1  
+app1: OOM exits in log=2 restarts=2 now=running/healthy
+app2: OOM exits in log=2 restarts=2 now=running/healthy
+app3: OOM exits in log=1 restarts=1 now=running/healthy
+first restart seen: [12:45:57] app1=running/healthy restarts=0  app2=running/healthy restarts=0  app3=running/healthy restarts=1  
+A: PASS (5 restart(s), all healthy again)
+=== B. hung instance -> unhealthy -> nginx routes around it
+[12:47:04] app2 JVM frozen (SIGSTOP)
+app2 marked unhealthy after: 13s
+k6 (B, 100 users, 40 s with app2 frozen): 201=8003 503=74 500=0 other(502/504/timeout)=102
+[12:47:56] after SIGCONT: app2=running/healthy
+nginx:     102 upstream timed out

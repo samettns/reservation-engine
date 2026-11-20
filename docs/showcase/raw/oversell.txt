@@ -1,0 +1,5 @@
+$ bash bench/showcase/oversell-demo.sh
+
+strategy   tickets   HTTP 201   DB holds  remaining   oversold  invariant holds+remaining=tickets
+naive          100        243        243         95        238  VIOLATED: 243 + 95 = 338
+atomic         100        100        100          0          0  OK
