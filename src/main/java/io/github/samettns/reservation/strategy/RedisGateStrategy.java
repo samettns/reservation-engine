@@ -1,6 +1,9 @@
 package io.github.samettns.reservation.strategy;
 
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
+import org.springframework.dao.DataAccessException;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
@@ -99,11 +102,14 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
     private final StringRedisTemplate redis;
     private final JdbcClient jdbc;
     private final AtomicUpdateStrategy database;
+    private final Counter bypassed;
 
-    public RedisGateStrategy(StringRedisTemplate redis, JdbcClient jdbc, AtomicUpdateStrategy database) {
+    public RedisGateStrategy(StringRedisTemplate redis, JdbcClient jdbc, AtomicUpdateStrategy database,
+                             MeterRegistry meters) {
         this.redis = redis;
         this.jdbc = jdbc;
         this.database = database;
+        this.bypassed = Counter.builder("reservation.redis_gate.bypassed").register(meters);
     }
 
     public static String stockKey(long eventId) {
@@ -134,10 +140,21 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
         }
         String key = stockKey(eventId);
 
-        long result = runGate(key);
-        if (result == NOT_INITIALISED) {
-            initialiseFromDatabase(eventId, key);
+        long result;
+        try {
             result = runGate(key);
+            if (result == NOT_INITIALISED) {
+                initialiseFromDatabase(eventId, key);
+                result = runGate(key);
+            }
+        } catch (DataAccessException redisUnavailable) {
+            // FAIL OPEN (stage 7b): Redis is only a gate in front of the DB, and the DB's atomic
+            // UPDATE has the final say, so without Redis the request goes to the DB directly:
+            // correct, just without the shortcut. (If the gate's DECR did run but its answer was
+            // lost, Redis ends one LOWER than the DB; the reconciler's raise fixes that.)
+            bypassed.increment();
+            log.warn("Redis gate unavailable ({}); event {} goes straight to the DB", redisUnavailable.getMessage(), eventId);
+            return database.tryAcquireOne(eventId);
         }
         if (result == SOLD_OUT) {
             return OptionalInt.empty();
@@ -156,7 +173,12 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
                 if (status != STATUS_COMMITTED) {
                     // Only if the counter still exists: after a Redis restart a plain INCR would
                     // create it with value 1, far below the DB (a false "sold out").
-                    redis.execute(INCREMENT_IF_PRESENT, List.of(key), "1");
+                    try {
+                        redis.execute(INCREMENT_IF_PRESENT, List.of(key), "1");
+                    } catch (DataAccessException e) {
+                        // Redis LOWER than the DB by one (safe for overselling); the reconciler raises it.
+                        log.warn("Could not give unit back to the Redis gate of event {}: {}", eventId, e.getMessage());
+                    }
                 }
             }
         });
@@ -175,8 +197,12 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
      */
     @Override
     public boolean knownSoldOut(long eventId) {
-        String value = redis.opsForValue().get(stockKey(eventId));
-        return value != null && Long.parseLong(value) <= 0;
+        try {
+            String value = redis.opsForValue().get(stockKey(eventId));
+            return value != null && Long.parseLong(value) <= 0;
+        } catch (DataAccessException redisUnavailable) {
+            return false; // fail open: "don't know" -> the normal path asks the DB
+        }
     }
 
     /**
@@ -193,7 +219,12 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCommit() {
-                redis.execute(RETURN_UNITS, List.of(key, returnsVersionKey(eventId)), Integer.toString(units));
+                try {
+                    redis.execute(RETURN_UNITS, List.of(key, returnsVersionKey(eventId)), Integer.toString(units));
+                } catch (DataAccessException e) {
+                    // The DB return is committed; Redis stays lower until the reconciler raises it.
+                    log.warn("Could not mirror {} returned unit(s) of event {} into Redis: {}", units, eventId, e.getMessage());
+                }
             }
         });
     }

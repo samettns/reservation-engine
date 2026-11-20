@@ -26,6 +26,10 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
+      # Stage 7b: without these, a Redis outage makes every request WAIT for Lettuce's default 60 s
+      # command timeout. Redis is only a gate in front of the DB, so give up quickly and fall back.
+      timeout: ${REDIS_TIMEOUT:500ms}
+      connect-timeout: ${REDIS_CONNECT_TIMEOUT:500ms}
 
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
@@ -42,6 +46,12 @@ spring:
         # nor reorder messages within a partition. (It does NOT cover our relay re-sending a batch
         # after a crash; consumers handle that with the inbox.)
         enable.idempotence: true
+        # Stage 7b: with the broker unreachable, send() itself blocks for metadata up to max.block.ms
+        # (default 60 s), holding the relay's transaction and DB connection. Fail within seconds
+        # instead; the rows stay unpublished and the next relay run retries them.
+        max.block.ms: ${KAFKA_MAX_BLOCK_MS:5000}
+        request.timeout.ms: ${KAFKA_REQUEST_TIMEOUT_MS:5000}
+        delivery.timeout.ms: ${KAFKA_DELIVERY_TIMEOUT_MS:10000}
     consumer:
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
