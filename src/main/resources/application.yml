@@ -102,3 +102,9 @@ management:
     web:
       exposure:
         include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      # /actuator/health/liveness ("the process answers"; no DB/Redis checks) for the container
+      # healthcheck, /actuator/health/readiness for "can take traffic".
+      probes:
+        enabled: true

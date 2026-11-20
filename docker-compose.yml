@@ -10,7 +10,12 @@
 x-app: &app
   image: reservation-engine:bench
   profiles: ["bench"]
+  # The JVM exits on OutOfMemoryError (Dockerfile); this brings the instance back. A manual
+  # `docker compose stop` is respected.
+  restart: unless-stopped
   environment:
+    # Override for experiments (bench/verify-failfast-live.sh uses a small heap to force an OOM).
+    JAVA_OPTS: ${APP_JAVA_OPTS:--Xms256m -Xmx512m -XX:+ExitOnOutOfMemoryError}
     DB_URL: jdbc:postgresql://postgres:5432/reservation
     REDIS_HOST: redis
     RESERVATION_STRATEGY: ${RESERVATION_STRATEGY:-atomic}
@@ -32,11 +37,17 @@ x-app: &app
       condition: service_healthy
     redis:
       condition: service_healthy
+  # Liveness, not overall health: "does this process still answer HTTP?". /actuator/health also
+  # checks the DB, so an instance that is merely overloaded (pool exhausted) would look dead.
+  # Before stage 7a this check needed 30 failures in a row (90 s) and showed a hung instance as
+  # healthy. Now: 2 s timeout, unhealthy after 3 misses (~10 s); start_period covers startup.
   healthcheck:
-    test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q UP"]
+    test: ["CMD-SHELL", "wget -q -T 2 -O- http://localhost:8080/actuator/health/liveness | grep -q UP"]
     interval: 3s
     timeout: 3s
-    retries: 30
+    retries: 3
+    start_period: 90s
+    start_interval: 2s
 
 services:
   # Instances are also published on 8081-8083 so the benchmark can scrape each one's
