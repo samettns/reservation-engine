@@ -24,10 +24,17 @@ import static org.assertj.core.api.Assertions.assertThat;
  * lease can expire, another request takes the key over, and then the old owner wakes up and carries
  * on as if it still owned the key. These tests pause request A deterministically between "claimed"
  * and "transaction starts", let the lease expire, let B take over, then resume A.
+ *
+ * <p>The lease is expired EXPLICITLY ({@link #expireLease}), not by sleeping past it. Leases are
+ * judged by the DB's wall clock ({@code now()}), and that clock can step: under WSL2/Docker it was
+ * measured going BACKWARDS by 163 ms during a 350 ms sleep, so A's 200 ms lease was still valid
+ * from the DB's point of view, B correctly could not take over, and the test failed (about 1 run
+ * in 50). The code was right; the test assumed the wall clock follows the JVM's sleep. The leases
+ * themselves are long (30 s), so no lease in these tests can run out by accident either.
  */
 class ClaimFencingTest extends IntegrationTest {
 
-    private static final Duration SHORT_LEASE = Duration.ofMillis(200);
+    private static final Duration LEASE = ReservationService.DEFAULT_IDEMPOTENCY_LEASE;
     private static final String UNIQUE_CONSTRAINT = "uq_reservations_user_idempotency_key";
 
     @Autowired
@@ -98,7 +105,7 @@ class ClaimFencingTest extends IntegrationTest {
         Thread a = Thread.ofVirtual().start(() ->
                 service(pauseAfterClaim(aClaimed, aGo)).reserve(eventId, "alice", key));
         await(aClaimed);
-        Thread.sleep(SHORT_LEASE.toMillis() + 150); // A's lease is over
+        expireLease("alice", key);                  // A's lease is over
 
         CountDownLatch bClaimed = new CountDownLatch(1);
         CountDownLatch bGo = new CountDownLatch(1);
@@ -134,7 +141,7 @@ class ClaimFencingTest extends IntegrationTest {
         Thread a = Thread.ofVirtual().start(() ->
                 aResult.set(service(pauseAfterClaim(aClaimed, aGo)).reserve(eventId, "alice", key)));
         await(aClaimed);
-        Thread.sleep(SHORT_LEASE.toMillis() + 150);
+        expireLease("alice", key);
 
         CountDownLatch bClaimed = new CountDownLatch(1);
         CountDownLatch bGo = new CountDownLatch(1);
@@ -167,7 +174,7 @@ class ClaimFencingTest extends IntegrationTest {
         Thread a = Thread.ofVirtual().start(() ->
                 aResult.set(service(pauseAfterClaim(aClaimed, aGo)).reserve(eventId, user, key)));
         await(aClaimed);
-        Thread.sleep(SHORT_LEASE.toMillis() + 150); // "GC pause": A's lease expires
+        expireLease(user, key); // "GC pause" long enough for A's lease to run out
 
         ReservationOutcome b = service(() -> { }).reserve(eventId, user, key); // takes the key over
         aGo.countDown();
@@ -178,7 +185,20 @@ class ClaimFencingTest extends IntegrationTest {
     private ReservationService service(Runnable afterClaim) {
         ReservationStrategy atomic = strategies.stream().filter(s -> s.name().equals("atomic")).findFirst().orElseThrow();
         return new ReservationService(atomic, reservations, events, reservationEvents, idempotency, tx,
-                ReservationService.DEFAULT_HOLD_TTL, SHORT_LEASE, new SimpleMeterRegistry(), afterClaim);
+                ReservationService.DEFAULT_HOLD_TTL, LEASE, new SimpleMeterRegistry(), afterClaim);
+    }
+
+    /**
+     * Ends the current owner's lease NOW, by the DB's own clock, instead of sleeping past it (the
+     * wall clock can step backwards; see the class comment).
+     */
+    private void expireLease(String user, String key) {
+        int updated = jdbc.sql("""
+                        UPDATE idempotency_keys SET locked_until = now() - interval '1 second'
+                        WHERE user_id = :user AND idempotency_key = :key AND status = 'IN_PROGRESS'
+                        """)
+                .param("user", user).param("key", key).update();
+        assertThat(updated).as("an IN_PROGRESS claim to expire").isEqualTo(1);
     }
 
     private static Runnable pauseAfterClaim(CountDownLatch claimed, CountDownLatch go) {

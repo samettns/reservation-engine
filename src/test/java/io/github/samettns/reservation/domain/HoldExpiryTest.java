@@ -192,7 +192,7 @@ class HoldExpiryTest extends IntegrationTest {
             paymentResult.set(reservations.confirmIfHeld(hold.id()));
         }));
         paymentTxStarted.await();
-        Thread.sleep(untilDeadline.plusMillis(300)); // deadline has passed for the sweeper
+        awaitDeadlinePassedOnDbClock(hold.id()); // deadline has passed for the sweeper
 
         CountDownLatch sweptNotCommitted = new CountDownLatch(1);
         CountDownLatch commitSweep = new CountDownLatch(1);
@@ -242,7 +242,7 @@ class HoldExpiryTest extends IntegrationTest {
             await(commitPayment);
         }));
         confirmedNotCommitted.await();
-        Thread.sleep(untilDeadline.plusMillis(300)); // deadline passed while the payment holds the lock
+        awaitDeadlinePassedOnDbClock(hold.id()); // deadline passed while the payment holds the lock
 
         HoldExpirySweeper sweeper = sweeper(200);
         int sweptWhileLocked = CompletableFuture.supplyAsync(sweeper::sweepOnce).get(5, TimeUnit.SECONDS);
@@ -362,6 +362,17 @@ class HoldExpiryTest extends IntegrationTest {
     private void setDeadline(UUID reservationId, Duration fromNow) {
         jdbc.sql("UPDATE reservations SET expires_at = now() + :ms * interval '1 millisecond' WHERE id = :id")
                 .param("ms", fromNow.toMillis()).param("id", reservationId).update();
+    }
+
+    /**
+     * Waits until the DB's own clock is past the hold's deadline. Not a fixed sleep: the deadline is
+     * judged by the DB's wall clock, which can step backwards (measured under WSL2/Docker), so
+     * "slept 1.8 s" does not guarantee "the DB sees the deadline as passed".
+     */
+    private void awaitDeadlinePassedOnDbClock(UUID reservationId) {
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(50)).until(() ->
+                jdbc.sql("SELECT clock_timestamp() > expires_at + interval '50 milliseconds' FROM reservations WHERE id = :id")
+                        .param("id", reservationId).query(Boolean.class).single());
     }
 
     private void backdateHeldDeadlines(long eventId) {

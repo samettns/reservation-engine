@@ -127,13 +127,13 @@ class RedisReconcilerTest extends IntegrationTest {
             willExpire = ((ReservationOutcome.Created) o).reservation();
         }
 
-        Lease a = lock.tryAcquire(NAME, Duration.ofMillis(200)).orElseThrow();
+        Lease a = lock.tryAcquire(NAME, Duration.ofSeconds(10)).orElseThrow();
         Map<Long, Target> aRead = reconciler.readTargets();
         assertThat(aRead.get(eventId).dbRemaining()).isEqualTo(7);
         // ---- A is paused (GC) ----
         expire(willExpire);                              // a unit comes back: DB 8, Redis 8
         assertThat(counter(eventId)).isEqualTo(8);
-        Thread.sleep(300);                               // A's lock expires
+        leaseRunsOut();                                  // A's lock expires
         Lease b = lock.tryAcquire(NAME, Duration.ofSeconds(10)).orElseThrow();
         assertThat(b.fenceToken()).isGreaterThan(a.fenceToken());
         assertThat(reconciler.write(b, eventId, reconciler.readTargets().get(eventId))).isEqualTo(WriteResult.UNCHANGED);
@@ -162,12 +162,12 @@ class RedisReconcilerTest extends IntegrationTest {
             service.reserve(eventId, "u" + i, "stale-raise-" + eventId + "-" + i);
         }
 
-        Lease a = lock.tryAcquire(NAME, Duration.ofMillis(200)).orElseThrow();
+        Lease a = lock.tryAcquire(NAME, Duration.ofSeconds(10)).orElseThrow();
         Target aRead = reconciler.readTargets().get(eventId);
         assertThat(aRead.dbRemaining()).isEqualTo(7);
         // ---- A is paused ----
         service.reserve(eventId, "u3", "stale-raise-" + eventId + "-3"); // DB 6, Redis 6
-        Thread.sleep(300);
+        leaseRunsOut();
         Lease b = lock.tryAcquire(NAME, Duration.ofSeconds(10)).orElseThrow();
         assertThat(reconciler.write(b, eventId, reconciler.readTargets().get(eventId))).isEqualTo(WriteResult.UNCHANGED);
         // ---- A wakes up ----
@@ -289,6 +289,15 @@ class RedisReconcilerTest extends IntegrationTest {
     }
 
     // --- helpers -------------------------------------------------------------
+
+    /**
+     * The lock's TTL runs out, which is exactly "Redis deletes the key". Done explicitly instead of
+     * sleeping past a short TTL: Redis judges expiry by the wall clock, which can step backwards
+     * (measured under WSL2/Docker; it made a lease-based test fail about 1 run in 50).
+     */
+    private void leaseRunsOut() {
+        assertThat(redis.delete(RedisLock.lockKey(NAME))).isTrue();
+    }
 
     /** Event with 2 units: one reservation in flight while a round runs, then committed. Redis 2, DB 1. */
     private void leaveCounterOneTooHigh(long eventId) {
