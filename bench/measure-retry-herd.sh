@@ -54,6 +54,24 @@ spark = "".join(blocks[min(8, round(8 * v / peak))] for v in series[:60])
 print(f"retries in steady window: {sum(series)}  per 100 ms: mean {mean:.0f}, max {max(series)}, min {min(series)}")
 print(f"peak/mean = {max(series) / mean:.2f}   coefficient of variation = {cv:.2f}   busiest 10% of buckets carry {100 * top10:.0f}% of retries")
 print(f"first 6 s, 100 ms buckets: {spark}")
+
+def autocorr(xs, lag):
+    m = statistics.mean(xs)
+    var = sum((x - m) ** 2 for x in xs)
+    return sum((xs[i] - m) * (xs[i + lag] - m) for i in range(len(xs) - lag)) / var if var else 0
+
+# Waves = periodicity: refused together, back together exactly Retry-After later, refused together...
+# A herd with Retry-After 1 s shows up as a clear autocorrelation peak at lag 1 s (10 buckets).
+print("autocorrelation at lag 0.5 s / 1 s / 2 s / 3 s: "
+      + " / ".join(f"{autocorr(series, l):+.2f}" for l in (5, 10, 20, 30)))
+
+# The classic herd: all 5,000 clients start at t=0, are refused together, come back together.
+early = {}
+for t in times:
+    if t < start + 6000:
+        early[(t - start) // 250] = early.get((t - start) // 250, 0) + 1
+first = [early.get(i, 0) for i in range(24)]
+print("first 6 s after the first retry, 250 ms buckets: " + " ".join(str(v) for v in first))
 EOF
   rm -f "$OUT/$name.csv"   # hundreds of MB; the summary above is what we keep
 done
