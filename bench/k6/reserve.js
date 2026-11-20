@@ -10,6 +10,7 @@
 // short-circuit the work being measured.
 
 import http from 'k6/http';
+import { sleep } from 'k6';
 import { Counter, Trend } from 'k6/metrics';
 
 const BASE_URL = __ENV.BASE_URL || 'http://nginx:80';
@@ -48,13 +49,37 @@ http.setResponseCallback(http.expectedStatuses(201, 409));
 
 const HEADERS = { 'Content-Type': 'application/json' };
 
+// RETRY_503=1: a well-behaved client. On 503 it waits Retry-After seconds and retries the SAME
+// request (same Idempotency-Key), up to MAX_ATTEMPTS times. Without it, a closed-model VU fires
+// its next request the moment it is refused, which turns fast refusals into a refusal storm.
+const RETRY_503 = __ENV.RETRY_503 === '1';
+const MAX_ATTEMPTS = parseInt(__ENV.MAX_ATTEMPTS || '10', 10);
+const createdEndToEnd = new Trend('latency_201_e2e', true); // first attempt -> 201, waits included
+const gaveUp = new Counter('gave_up_after_503');
+
 export default function () {
   const id = `${__VU}-${__ITER}`;
-  const res = http.post(
-    `${BASE_URL}/events/${EVENT_ID}/reserve`,
-    JSON.stringify({ userId: `u-${id}` }),
-    { headers: { ...HEADERS, 'Idempotency-Key': `${RUN_ID}-${id}` }, tags: { name: 'reserve' } },
-  );
+  const started = Date.now();
+  let res;
+  for (let attempt = 1; ; attempt++) {
+    res = http.post(
+      `${BASE_URL}/events/${EVENT_ID}/reserve`,
+      JSON.stringify({ userId: `u-${id}` }),
+      { headers: { ...HEADERS, 'Idempotency-Key': `${RUN_ID}-${id}` }, tags: { name: 'reserve' } },
+    );
+    if (!RETRY_503 || res.status !== 503) {
+      break;
+    }
+    contended.add(1); // every refused attempt is counted
+    if (attempt === MAX_ATTEMPTS) {
+      gaveUp.add(1);
+      return;
+    }
+    sleep(parseFloat(res.headers['Retry-After'] || '1'));
+  }
+  if (res.status === 201) {
+    createdEndToEnd.add(Date.now() - started);
+  }
   switch (res.status) {
     case 201:
       created.add(1);

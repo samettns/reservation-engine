@@ -377,12 +377,78 @@ olarak tutan tur da DB'yi `t_okuma` anında okuyup Redis'e `t_yazma` anında yaz
     farkı tüketti.
   - 6 mutasyonun hepsi yakalandı.
 
+## Aşırı yük ve zehirli mesajlar (Aşama 7a)
+
+**Aşırı yükte 500 yerine 503.**
+- Havuzdan bağlantı alınamazsa (havuz dolu ya da DB yok) veya Redis'e ulaşılamazsa artık `503` dönüyor:
+  `Retry-After: 1` başlığıyla, tipi `urn:problem-type:dependency-unavailable`.
+- Havuz beklemesi 5 sn'den 500 ms'ye indi (`DB_CONNECTION_TIMEOUT_MS`).
+
+**Yük atma (load shedding).**
+- Instance başına en fazla `SHED_MAX_IN_FLIGHT` (varsayılan 100) rezervasyon isteği aynı anda işleniyor.
+- Fazlası hiç iş yapılmadan, mikrosaniyeler içinde `503` alıyor (`urn:problem-type:overloaded`).
+- Reddetme idempotency claim'inden önce oluyor; aynı key ile tekrar deneme normal işleniyor.
+- `POST /reservations/{id}/confirm` hiç reddedilmiyor. Ödeme onayı gecikirse, ödenmiş bir rezervasyonun süresi
+  dolabilir.
+
+**Kafka dead-letter topic (`reservation-events.DLT`).**
+
+| Hata türü | Davranış |
+|---|---|
+| Mesaj kaynaklı (bug, constraint ihlali) | 3 deneme (200 ms arayla), sonra DLT. Gerçek hata DLT başlıklarında. Partition devam ediyor. |
+| Bozuk içerik (eksik başlık, bozuk UUID/sayı) | Tekrar denenmeden DLT. |
+| Ortam kaynaklı (DB'ye ulaşılamıyor) | DLT'ye **gitmiyor**. Üstel bekleme ile (en fazla 5 sn) kesinti bitene kadar tekrar deneniyor. Mesajın suçu yok; DLT'ye atmak bütün topic'i DLT'ye taşırdı. |
+
+- Takas: DLT'ye düşen mesaj, o rezervasyonun sıralamasını bozuyor (sonraki olaylar onsuz işleniyor).
+  Alternatifi, partition'daki bütün rezervasyonların durması.
+- Aşama 5a'daki senaryo testle yeniden üretildi (`DeadLetterTest`): tek mesajı reddeden bir CHECK constraint.
+  Mesaj 3 kez denendi ve DLT'ye gitti; arkasındaki mesaj işlendi. 5a'daki gerçek NULL hatasının istisnası da
+  poison olarak sınıflanıyor.
+- Kesinti testi: havuzdaki bütün bağlantılar tutuldu. Mesaj 3'ten fazla denendi, DLT'ye gitmedi ve bağlantılar
+  bırakılınca işlendi.
+- Mutasyon kontrolü: 6 mutasyonun hepsi yakalandı.
+
+**5.000 kullanıcı, önce / sonra** (`bash bench/run-overload.sh`, tek koşu, **ön sonuç**). Bu ölçümde k6
+istemcileri `Retry-After`'a uymuyor: reddedilen VU bir sonraki isteği hemen gönderiyor. Tam tablo:
+[`docs/benchmarks/overload/comparison.md`](docs/benchmarks/overload/comparison.md).
+
+| Varyant | 500 oranı | Başarılı rezervasyon/sn (contention) | Başarılı p99 (contention) | Başarılı p99 (sellout) | Ölen instance |
+|---|---|---|---|---|---|
+| Önce (5 sn bekleme, 500) | %78–83 contention, %6–60 sellout | 117–149 | 12,7–14,9 sn | 4,5–14,3 sn | yok |
+| Shed'siz (500 ms bekleme, 503) | %0 | **0,9–2,3** | 8,1–16,5 sn | 10,7–12,1 sn | **contention koşusunun hepsinde 1 instance (OOM)** |
+| Sonra (yük atma, limit 100) | %0 | 55–70 | 6,2–7,7 sn | 1,9–2,6 sn | yok |
+
+Okuma:
+- **500'ler tamamen kalktı.**
+- **Bekleme süresini kısaltmak tek başına zararlı.**
+  - Bekleme 5 sn'den 500 ms'ye inince başarısız istekler 10 kat hızlı geri dönüyor; istemci de aynı hızla yeniden
+    deniyor.
+  - Bu çalkantı 512 MB heap'i doldurdu. `OutOfMemoryError`, Tomcat'in Acceptor ve Poller thread'lerini de
+    öldürdü: instance yaşıyor ama bir daha bağlantı kabul etmiyor.
+  - Bu, her contention koşusunda bir instance'ta oldu. Benchmark sürücüsü artık yanıt vermeyen instance'ı satıra
+    yazıp konteynerleri yeniden başlatıyor.
+- **Yük atma instance'ları ayakta tutuyor ve başarılı isteklerin gecikmesini yarıya, sellout'ta 2–6 kata indiriyor.**
+- **Ama contention'da başarılı throughput yarıya düştü (≈135 → ≈65/sn).** İki neden var:
+  1. `Retry-After`'a uymayan istemciler saniyede ~10.000 reddetme üretiyor. nginx, 3 JVM ve k6 aynı makinede;
+     bu yük kabul edilen isteklerin CPU'sunu yiyor.
+  2. 100 limiti sıcak satır için fazla yüksek. Ortalama havuz beklemesi hâlâ ~380 ms. Little yasası: 300 istek
+     uçuşta, ~60/sn throughput → ~5 sn gecikme (ölçülen p99 6–7 sn).
+- **Sellout'ta stok satılmadan kaldı (1.000 biriminin 396–984'ü, shed'siz ve sonra).** 20.000 isteğin %97'si 503
+  aldı ve bu ölçümdeki istemci 503'ten sonra vazgeçiyor. 503 "tükendi" değil, "sonra tekrar dene" demek; tekrar
+  denemeyen istemciyle stok satılamaz. Aşağıdaki tekrar ölçümün asıl nedeni bu.
+- **Sonraki ölçüm (bekliyor):** `Retry-After`'a uyan istemci (bekle, aynı key ile en fazla 10 deneme) ve limit
+  100'e karşı 20 (≈ havuz boyutu). İstemci değişikliği "önce" sütununu etkilemiyor, çünkü o hiç 503 dönmüyor.
+  İlk deneme bellek baskısı nedeniyle yarıda durduruldu.
+
 ## Bilinen sınırlamalar
 
 | Sınırlama | Etki | Çözüm planı |
 |---|---|---|
 | **Idempotency claim'i her başarılı rezervasyona bir commit ekliyor.** | Yazma ağırlıklı senaryoda throughput'a etkisi henüz ölçülmedi. | Aşama 8 (final benchmark). |
-| **Zehirli mesaj partition'ı durdurabilir.** Consumer'da işlenemeyen bir mesaj yeniden denenirken aynı partition'daki sonraki mesajlar bekliyor (geliştirme sırasında bir NULL hatasıyla yaşandı). | Bir hata, bir partition'daki bütün olayları geciktirir. | Aşama 7: dead-letter topic. |
+| **Zehirli mesaj partition'ı durdurabilir.** Consumer'da işlenemeyen bir mesaj yeniden denenirken aynı partition'daki sonraki mesajlar bekliyor (geliştirme sırasında bir NULL hatasıyla yaşandı). | Bir hata, bir partition'daki bütün olayları geciktirir. | **Aşama 7a'da çözüldü:** 3 deneme, sonra dead-letter topic. |
+| **DLT'deki mesajları yeniden yayınlayan bir araç yok.** | Hata düzeltilince mesajlar elle yeniden yayınlanmalı (consumer idempotent olduğu için güvenli). | Kapsam dışı; `reservation.consumer.dead_lettered` sayacı ve ERROR log'u alarm için var. |
+| **Yük atma limiti sabit ve henüz ayarlanmadı.** Sıcak satırda 100 fazla yüksek (bkz. Aşama 7a ölçümü). | Kabul edilen istekler kuyrukta bekliyor; p99 hâlâ saniyeler mertebesinde. | Retry-After'a uyan istemciyle 100 / 20 ölçümü (bekliyor). Sonrası: gecikmeye göre kendini ayarlayan limit (adaptive concurrency). |
+| **Havuz zaman aşımında claim'in bırakılması da bağlantı alamayabilir.** | Aynı key ile tekrar deneme, claim'in kirası (30 sn) dolana kadar "işlemde" (409) alır. | Not edildi. |
 | **Outbox tablosu büyüyor.** Yayınlanmış satırlar silinmiyor. | Disk kullanımı zamanla artar. | Saklama süresi dolanları silen bir temizlik işi (kapsam dışı, not edildi). |
 | **Shard sayısı etkinlik oluşturulurken sabitleniyor.** | Yayındaki bir etkinliğin shard sayısı değiştirilemez (resharding yok). | Kapsam dışı. |
 | **Redis düşüşü ile DB sonucu arasında çökme.** Redis'ten birim düşüldükten sonra, DB transaction'ı sonuçlanıp telafi (`INCR`) çalışmadan uygulama çökerse, düşülen birim Redis'e hiç iade edilmez. | Redis sayacı bir sonraki mutabakat turuna kadar (varsayılan 30 sn) DB'den düşük kalır: o birimler bu süre boyunca satılamaz. | **Aşama 6'da çözüldü:** fencing'li mutabakat işi. |

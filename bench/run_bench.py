@@ -69,12 +69,12 @@ K6_DOCKER = [
 FIELDS = [
     "strategy", "mode", "shards", "vus", "duration_s", "requests", "rps", "reserved_per_s",
     "status_201", "status_409", "status_503", "status_500", "status_other", "rate_503",
-    "p50_ms", "p95_ms", "p99_ms", "max_ms", "p99_201_ms",
+    "p50_ms", "p95_ms", "p99_ms", "max_ms", "p99_201_ms", "p99_201_e2e_ms", "gave_up_after_503",
     "avg_retries", "max_retries",
     "hikari_acquire_avg_ms", "hikari_timeouts",
     "db_active_avg", "db_lock_wait_pct", "db_io_wait_pct", "db_lwlock_wait_pct",
     "total_stock", "db_reserved", "db_remaining", "oversold", "k6_201_equals_db",
-    "unsold_after_sellout", "shards_touched",
+    "unsold_after_sellout", "shards_touched", "unresponsive",
 ]
 
 
@@ -171,6 +171,20 @@ def psql_value(sql):
     return int(out)
 
 
+def stock_snapshot(event_id):
+    """
+    The invariant check reads PostgreSQL directly (same numbers as GET /events/{id}/stock), not via
+    the API: right after an overload run an instance can still be shedding (503) or be dead.
+    """
+    i = int(event_id)
+    return {
+        "totalStock": psql_value(f"SELECT total_stock FROM events WHERE id = {i}"),
+        "remaining": psql_value(f"SELECT COALESCE(SUM(qty), 0) FROM stock WHERE event_id = {i}"),
+        "reserved": psql_value(f"SELECT count(*) FROM reservations WHERE event_id = {i} "
+                               f"AND status IN ('HELD', 'CONFIRMED')"),
+    }
+
+
 def shards_touched(event_id):
     """How many stock shards were actually drawn from (each started at total_stock / shard_count)."""
     return psql_value(f"SELECT count(*) FROM stock s JOIN events e ON e.id = s.event_id "
@@ -186,17 +200,43 @@ def create_event(stock, shards=1):
 METRIC_LINE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+([-+0-9.eE]+|NaN)$')
 
 
+UNRESPONSIVE = set()  # instances that stopped answering during the current run (e.g. out of memory)
+
+
 def scrape():
-    """Sums each metric series over the three instances: {(name, labels): value}."""
+    """Sums each metric series over the instances that answer: {(name, labels): value}."""
     totals = {}
     for base in INSTANCES:
-        with urllib.request.urlopen(f"{base}/actuator/prometheus", timeout=10) as resp:
-            for line in resp.read().decode().splitlines():
-                m = METRIC_LINE.match(line)
-                if m and m.group(3) != "NaN":
-                    key = (m.group(1), m.group(2) or "")
-                    totals[key] = totals.get(key, 0.0) + float(m.group(3))
+        body = fetch_metrics(base)
+        if body is None:
+            UNRESPONSIVE.add(base)
+            continue
+        for line in body.splitlines():
+            m = METRIC_LINE.match(line)
+            if m and m.group(3) != "NaN":
+                key = (m.group(1), m.group(2) or "")
+                totals[key] = totals.get(key, 0.0) + float(m.group(3))
     return totals
+
+
+def fetch_metrics(base, attempts=3):
+    """
+    An instance can stop answering after an overload run (in stage 7a's no-shedding variant one ran
+    out of heap and Tomcat's acceptor thread died). Retry, then record it instead of aborting the
+    matrix: the next strategy recreates the containers anyway.
+    """
+    start = time.time()
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(f"{base}/actuator/prometheus", timeout=10) as resp:
+                body = resp.read().decode()
+            if attempt > 1:
+                log(f"!! {base} answered the metrics scrape only after {time.time() - start:.0f}s")
+            return body
+        except (TimeoutError, OSError) as e:
+            log(f"   {base} metrics scrape attempt {attempt} failed ({e})")
+    log(f"!! {base} UNRESPONSIVE after {time.time() - start:.0f}s; its metrics are missing from this row")
+    return None
 
 
 def diff(after, before, name, label_filter=""):
@@ -235,6 +275,8 @@ def run_k6(mode, vus, event_id, run_id, summary_name):
         "-e", "BASE_URL=http://nginx:80", "-e", f"EVENT_ID={event_id}", "-e", f"RUN_ID={run_id}",
         "-e", f"MODE={mode}", "-e", f"VUS={vus}", "-e", f"DURATION={DURATION}",
         "-e", f"ITERATIONS={SELLOUT_REQUESTS}", "-e", f"SUMMARY_FILE=/results/raw/{summary_name}",
+        # 1 = clients honour 503 + Retry-After (wait, retry the same key); stage 7a overload runs
+        "-e", f"RETRY_503={os.environ.get('BENCH_RETRY_503', '0')}",
     ]
     sh(*K6_DOCKER, "run", "--quiet", *env, "/scripts/reserve.js")
     with open(RAW / summary_name) as f:
@@ -255,6 +297,7 @@ def warm_up(strategy):
 
 
 def run_one(strategy, mode, shards, vus):
+    UNRESPONSIVE.clear()
     reset_state()
     stock = SELLOUT_STOCK if mode == "sellout" else CONTENTION_STOCK
     event_id = create_event(stock, shards)
@@ -266,7 +309,7 @@ def run_one(strategy, mode, shards, vus):
     summary = run_k6(mode, vus, event_id, run_id, f"{run_id}.json")
     db_active, lock_pct, io_pct, lwlock_pct = sampler.stop()
     after = scrape()
-    snapshot = http_json("GET", f"{NGINX}/events/{event_id}/stock")
+    snapshot = stock_snapshot(event_id)
     touched = shards_touched(event_id)
 
     duration_s = summary["state"]["testRunDurationMs"] / 1000
@@ -287,6 +330,7 @@ def run_one(strategy, mode, shards, vus):
     acquire_ms, timeouts = hikari_stats(before, after)
     latency = summary["metrics"]["http_req_duration"]["values"]
     created_latency = summary["metrics"].get("latency_201", {}).get("values")
+    e2e = summary["metrics"].get("latency_201_e2e", {}).get("values")
 
     return {
         "strategy": strategy, "mode": mode, "shards": shards, "vus": vus,
@@ -298,6 +342,9 @@ def run_one(strategy, mode, shards, vus):
         "p99_ms": round(latency["p(99)"], 2), "max_ms": round(latency["max"], 2),
         # Latency of the SUCCESSFUL reservations only (k6 trend latency_201): the user-facing cost.
         "p99_201_ms": round(created_latency["p(99)"], 2) if created_latency else "",
+        # With BENCH_RETRY_503=1: from the first attempt to the 201, Retry-After waits included.
+        "p99_201_e2e_ms": round(e2e["p(99)"], 2) if e2e else "",
+        "gave_up_after_503": int(metric(summary, "gave_up_after_503")),
         "avg_retries": avg_retries, "max_retries": max_retries,
         "hikari_acquire_avg_ms": acquire_ms, "hikari_timeouts": timeouts,
         "db_active_avg": db_active, "db_lock_wait_pct": lock_pct, "db_io_wait_pct": io_pct,
@@ -308,6 +355,7 @@ def run_one(strategy, mode, shards, vus):
         "oversold": snapshot["reserved"] + snapshot["remaining"] - snapshot["totalStock"],
         "k6_201_equals_db": int(s201) == snapshot["reserved"],
         "unsold_after_sellout": unsold, "shards_touched": touched,
+        "unresponsive": " ".join(sorted(b.rsplit(":", 1)[1] for b in UNRESPONSIVE)),
     }
 
 
@@ -332,7 +380,12 @@ def main():
                             f"retries={row['avg_retries']}/{row['max_retries']} "
                             f"lock%={row['db_lock_wait_pct']} io%={row['db_io_wait_pct']} "
                             f"lwlock%={row['db_lwlock_wait_pct']} active={row['db_active_avg']} "
-                            f"oversold={row['oversold']}")
+                            f"oversold={row['oversold']} 500={row['status_500']} "
+                            f"unresponsive={row['unresponsive'] or '-'}")
+                        if row["unresponsive"]:
+                            # A dead instance would distort every following run of this strategy.
+                            log(f"!! restarting the instances after {strategy} {mode}: {row['unresponsive']} died")
+                            start_strategy(strategy)
     log(f"done -> {CSV_PATH}")
 
 
