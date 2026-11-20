@@ -15,7 +15,9 @@ spring:
     hikari:
       # Set explicitly (default is 10) because it is one of the main knobs in the benchmarks.
       maximum-pool-size: ${DB_POOL_SIZE:20}
-      connection-timeout: ${DB_CONNECTION_TIMEOUT_MS:5000}
+      # How long a request waits for a free connection before failing with 503 (fail fast; the
+      # load-shedding limit below keeps this queue short in the first place). Hikari minimum: 250.
+      connection-timeout: ${DB_CONNECTION_TIMEOUT_MS:500}
 
   flyway:
     locations: classpath:db/migration
@@ -82,6 +84,15 @@ reservation:
       batch-size: ${OUTBOX_RELAY_BATCH_SIZE:100}
     consumer:
       enabled: ${EVENTS_ENABLED:true}
+      # A message that keeps failing goes to reservation-events.DLT after this many deliveries.
+      # (DB/connection outages are retried without limit instead: they are not the message's fault.)
+      max-attempts: ${CONSUMER_MAX_ATTEMPTS:3}
+      retry-backoff: ${CONSUMER_RETRY_BACKOFF:PT0.2S}
+  load-shedding:
+    # At most this many reservation requests in progress per instance; more get 503 + Retry-After
+    # at once. Rule of thumb: a few times the DB pool size (requests also spend time in Redis/HTTP).
+    enabled: ${SHED_ENABLED:true}
+    max-in-flight: ${SHED_MAX_IN_FLIGHT:100}
 
 server:
   shutdown: graceful

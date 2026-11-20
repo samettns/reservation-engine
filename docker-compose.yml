@@ -16,6 +16,10 @@ x-app: &app
     RESERVATION_STRATEGY: ${RESERVATION_STRATEGY:-atomic}
     # 3 instances x 20 = 60 connections, below PostgreSQL's default max_connections (100).
     DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+    DB_CONNECTION_TIMEOUT_MS: ${DB_CONNECTION_TIMEOUT_MS:-500}
+    # Load shedding (stage 7a): reservation requests in progress per instance before 503.
+    SHED_ENABLED: ${SHED_ENABLED:-true}
+    SHED_MAX_IN_FLIGHT: ${SHED_MAX_IN_FLIGHT:-100}
     HOLD_TTL: ${HOLD_TTL:-PT10M}
     EXPIRY_INTERVAL: ${EXPIRY_INTERVAL:-PT1S}
     KAFKA_BOOTSTRAP_SERVERS: kafka:19092

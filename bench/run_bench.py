@@ -68,8 +68,8 @@ K6_DOCKER = [
 
 FIELDS = [
     "strategy", "mode", "shards", "vus", "duration_s", "requests", "rps", "reserved_per_s",
-    "status_201", "status_409", "status_503", "status_other", "rate_503",
-    "p50_ms", "p95_ms", "p99_ms", "max_ms",
+    "status_201", "status_409", "status_503", "status_500", "status_other", "rate_503",
+    "p50_ms", "p95_ms", "p99_ms", "max_ms", "p99_201_ms",
     "avg_retries", "max_retries",
     "hikari_acquire_avg_ms", "hikari_timeouts",
     "db_active_avg", "db_lock_wait_pct", "db_io_wait_pct", "db_lwlock_wait_pct",
@@ -272,7 +272,8 @@ def run_one(strategy, mode, shards, vus):
     duration_s = summary["state"]["testRunDurationMs"] / 1000
     s201, s409 = metric(summary, "status_201"), metric(summary, "status_409")
     s503, other = metric(summary, "status_503"), metric(summary, "status_other")
-    requests = s201 + s409 + s503 + other
+    s500 = metric(summary, "status_500")
+    requests = s201 + s409 + s503 + s500 + other
 
     # Sanity checks on the benchmark itself (the invariant alone does not catch "undersell"):
     # a sellout with more requests than stock must end with nothing left, and a sharded run
@@ -285,15 +286,18 @@ def run_one(strategy, mode, shards, vus):
     avg_retries, max_retries = retry_stats(before, after)
     acquire_ms, timeouts = hikari_stats(before, after)
     latency = summary["metrics"]["http_req_duration"]["values"]
+    created_latency = summary["metrics"].get("latency_201", {}).get("values")
 
     return {
         "strategy": strategy, "mode": mode, "shards": shards, "vus": vus,
         "duration_s": round(duration_s, 2), "requests": int(requests),
         "rps": round(requests / duration_s, 1), "reserved_per_s": round(s201 / duration_s, 1),
-        "status_201": int(s201), "status_409": int(s409), "status_503": int(s503), "status_other": int(other),
+        "status_201": int(s201), "status_409": int(s409), "status_503": int(s503), "status_500": int(s500), "status_other": int(other),
         "rate_503": round(s503 / requests, 4) if requests else 0,
         "p50_ms": round(latency["med"], 2), "p95_ms": round(latency["p(95)"], 2),
         "p99_ms": round(latency["p(99)"], 2), "max_ms": round(latency["max"], 2),
+        # Latency of the SUCCESSFUL reservations only (k6 trend latency_201): the user-facing cost.
+        "p99_201_ms": round(created_latency["p(99)"], 2) if created_latency else "",
         "avg_retries": avg_retries, "max_retries": max_retries,
         "hikari_acquire_avg_ms": acquire_ms, "hikari_timeouts": timeouts,
         "db_active_avg": db_active, "db_lock_wait_pct": lock_pct, "db_io_wait_pct": io_pct,

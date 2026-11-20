@@ -35,6 +35,7 @@ public class NotificationConsumer {
     private final Counter applied;
     private final Counter duplicates;
     private final Counter outOfOrder;
+    private final Counter failures;
 
     public NotificationConsumer(JdbcClient jdbc, TransactionTemplate tx, MeterRegistry meters) {
         this.jdbc = jdbc;
@@ -42,11 +43,26 @@ public class NotificationConsumer {
         this.applied = Counter.builder("reservation.consumer.applied").register(meters);
         this.duplicates = Counter.builder("reservation.consumer.duplicates").register(meters);
         this.outOfOrder = Counter.builder("reservation.consumer.out_of_order").register(meters);
+        this.failures = Counter.builder("reservation.consumer.failures").register(meters);
     }
 
+    /**
+     * A failure is rethrown to the container's error handler (see
+     * {@code MessagingConfiguration#kafkaErrorHandler}): retry, then dead-letter topic, so one bad
+     * message cannot block its partition. The transaction has rolled back, so a retry starts clean.
+     */
     @KafkaListener(id = "notifications", topics = OutboxRelay.TOPIC, groupId = "reservation-notifications",
             autoStartup = "${reservation.events.consumer.enabled:true}")
     public void onMessage(ConsumerRecord<String, String> record) {
+        try {
+            handle(record);
+        } catch (RuntimeException e) {
+            failures.increment(); // one per failed delivery attempt
+            throw e;
+        }
+    }
+
+    private void handle(ConsumerRecord<String, String> record) {
         UUID messageId = UUID.fromString(header(record, OutboxRelay.HEADER_MESSAGE_ID));
         String eventType = header(record, OutboxRelay.HEADER_EVENT_TYPE);
         long outboxId = Long.parseLong(header(record, OutboxRelay.HEADER_OUTBOX_ID));

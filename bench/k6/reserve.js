@@ -21,7 +21,8 @@ const VUS = parseInt(__ENV.VUS || '10', 10);
 const created = new Counter('status_201');
 const soldOut = new Counter('status_409');
 const contended = new Counter('status_503');
-const other = new Counter('status_other');
+const serverError = new Counter('status_500');
+const other = new Counter('status_other'); // anything else: 502/504 from nginx, timeouts (status 0)...
 const createdLatency = new Trend('latency_201', true);
 
 function scenario() {
@@ -64,6 +65,9 @@ export default function () {
       break;
     case 503:
       contended.add(1);
+      break;
+    case 500:
+      serverError.add(1);
       break;
     default:
       other.add(1);
