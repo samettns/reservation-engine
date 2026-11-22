@@ -273,10 +273,16 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
 
         // From here on Redis has been decremented: give the unit back if the DB transaction
         // does not commit (strategy fails below, reservation INSERT fails, duplicate key...).
+        // But ONLY if the DB actually had a unit for this decrement. If the DB was already empty
+        // (Redis over-reported, e.g. a verifying gate request took the unit of an in-flight one),
+        // the decrement is correct and must stay, whatever the transaction does: with
+        // tx-order=stock-last a sold-out transaction ROLLS BACK (its inserts were in vain), and
+        // giving the unit back then left Redis one ABOVE the DB per such request.
+        boolean[] dbHadUnit = {true};
         TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
             @Override
             public void afterCompletion(int status) {
-                if (status != STATUS_COMMITTED) {
+                if (status != STATUS_COMMITTED && dbHadUnit[0]) {
                     // Only if the counter still exists: after a Redis restart a plain INCR would
                     // create it with value 1, far below the DB (a false "sold out").
                     try {
@@ -291,6 +297,7 @@ public class RedisGateStrategy implements ReservationStrategy, StockReturnListen
 
         OptionalInt shard = database.tryAcquireOne(eventId);
         if (shard.isEmpty()) {
+            dbHadUnit[0] = false;
             log.warn("Redis/DB drift on event {}: Redis allowed a reservation but the DB is sold out", eventId);
         }
         return shard;
