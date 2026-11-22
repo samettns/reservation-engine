@@ -1,10 +1,10 @@
 $ docker compose --profile bench ps --format 'table {{.Service}}\t{{.Image}}\t{{.Status}}'
 
 SERVICE    IMAGE                      STATUS
-app1       reservation-engine:bench   Up 13 seconds (healthy)
-app2       reservation-engine:bench   Up 13 seconds (healthy)
-app3       reservation-engine:bench   Up 13 seconds (healthy)
-kafka      apache/kafka:3.9.1         Up 25 seconds (healthy)
+app1       reservation-engine:bench   Up 15 seconds (healthy)
+app2       reservation-engine:bench   Up 15 seconds (healthy)
+app3       reservation-engine:bench   Up 15 seconds (healthy)
+kafka      apache/kafka:3.9.1         Up 29 seconds (healthy)
 nginx      nginx:1.27-alpine          Up 1 second
-postgres   postgres:17-alpine         Up 4 minutes (healthy)
-redis      redis:7.4-alpine           Up 4 minutes (healthy)
+postgres   postgres:17-alpine         Up 2 hours (healthy)
+redis      redis:7.4-alpine           Up 2 hours (healthy)

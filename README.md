@@ -7,15 +7,13 @@ Yüksek eşzamanlılık altında sınırlı stoğu satan (konser bileti, flaş i
 kazanç sharding'den (yazmada 3–6 kat) ve "tükendi" kısayollarından (flaş satışta 1,6–7,6 kat) geliyor
 ([final benchmark](#final-benchmark-aşama-8)).
 
-> 🚧 Geliştirme aşamasında. Tam README (mimari, benchmark grafikleri, trade-off'lar) son aşamada eklenecek.
-
 **Gerçek koşulardan görseller** (hepsi ve açıklamaları: [`docs/showcase/`](docs/showcase/README.md)):
 
 | | |
 |---|---|
-| **API akışı:** `201` → aynı key ile `200` + `Idempotent-Replayed` → `409` tükendi → `200` onay → süresi dolmuş tutuma `410` | **Overselling:** 100 bilet için 1.000 eşzamanlı istek. `naive` 243 sattı, `atomic` tam 100 |
+| **API akışı:** `201` → aynı key ile `200` + `Idempotent-Replayed` → `409` tükendi → `200` onay → süresi dolmuş tutuma `410` | **Overselling:** 100 bilet için 1.000 eşzamanlı istek. `naive` 230 sattı, `atomic` tam 100 |
 | ![API akışı](docs/showcase/api-flow.gif) | ![naive ve atomic](docs/showcase/oversell.png) |
-| **Fail fast:** OOM'da JVM çıkıyor ve yeniden başlıyor; donmuş instance 13 sn'de "unhealthy" oluyor, nginx onu trafikten çıkarıyor | **Mimari** |
+| **Fail fast:** OOM'da JVM çıkıyor ve yeniden başlıyor; donmuş instance 14 sn'de "unhealthy" oluyor, nginx onu trafikten çıkarıyor | **Mimari** |
 | ![fail fast](docs/showcase/failfast.png) | ![mimari](docs/showcase/architecture.png) |
 
 ## Hızlı başlangıç
@@ -878,3 +876,7 @@ değer uygulamayı başlatmıyor (yazım hatası sessizce diğer sırayı seçme
 | **Thundering-herd ölçümünde görülen 1 sn periyodikliğin kaynağı** | Jitter'la bozulmadığı için senkron tekrar denemelerden gelmiyor. Aday: saniyede bir çalışan hold süresi süpürücüsü ya da GC; süpürücü aralığı değiştirilerek test edilebilir. |
 | **Yük üreticisini sistemden ayırmak** (k6 ayrı makinede ya da sınırlı CPU ile) | Bütün ölçümlerde k6, nginx ve üç JVM aynı makinede; yük üretici sistemle aynı CPU'yu paylaşıyor. Mutlak sayılar bu yüzden "bu laptop"a özgü; karşılaştırmalar aynı koşullarda. |
 | **DLT'deki mesajları yeniden yayınlama aracı, outbox temizliği, resharding** | Bilinen sınırlamalar tablosunda; işlevsel olarak gerekli ama bu projenin konusu olan eşzamanlılık ve doğruluk sorularına bir şey eklemiyor. |
+
+## Lisans
+
+[MIT](LICENSE)

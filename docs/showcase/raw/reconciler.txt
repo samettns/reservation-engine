@@ -4,7 +4,7 @@ before drift:  redis=91  db=90
 drift injected: redis=83   (7 units lost, as after a crash)
 redis every 200 ms: 83 83 83 83 83 83 83 83 83 83 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 
 5 s later:    redis=90  db=90
-fence token issued so far: 12
-instance :8081 rounds acquired 4, skipped 1, corrections 2
-instance :8082 rounds acquired 5, skipped 0, corrections 1
+fence token issued so far: 9
+instance :8081 rounds acquired 2, skipped 3, corrections 0
+instance :8082 rounds acquired 4, skipped 1, corrections 3
 instance :8083 rounds acquired 4, skipped 1, corrections 0

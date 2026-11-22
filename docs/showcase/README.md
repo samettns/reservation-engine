@@ -28,16 +28,16 @@ GIF'ten kesildi.
 ![naive ve atomic](oversell.png)
 
 100 bilet için 1.000 eşzamanlı istek: 3 instance, nginx, k6. Sonuç doğrudan PostgreSQL'den okundu.
-- **`naive`:** "oku, sonra okuduğunu yaz". 243 rezervasyon yaptı ve stokta hâlâ 95 görünüyor; 238 birim
+- **`naive`:** "oku, sonra okuduğunu yaz". 230 rezervasyon yaptı ve stokta hâlâ 90 görünüyor; 220 birim
   fazla satıldı. Kayıp güncellemeler yüzünden hem fazla satıyor hem de satılanları stoktan düşemiyor.
 - **`atomic`:** `UPDATE ... WHERE qty > 0`. Tam olarak 100 sattı, invariant sağlandı.
 
 ## Tam test paketi
 
-![97 test, 0 hata](tests.png)
+![149 test, 0 hata](tests.png)
 
-`./mvnw verify` çıktısının özeti: 97 test, 0 hata. Gerçek PostgreSQL, Redis ve Kafka ile çalışıyor
-(Testcontainers).
+`./mvnw verify` çıktısının özeti: 149 test, 0 hata (hata enjeksiyonu testleri dahil). Gerçek PostgreSQL, Redis
+ve Kafka ile çalışıyor (Testcontainers, Toxiproxy).
 
 ## Mutasyon örneği: deadlock düzeltmesi kaldırılınca
 
@@ -45,8 +45,8 @@ GIF'ten kesildi.
 
 Aşama 3'teki düzeltme: pessimistic strateji, boş bir shard'ın satır kilidini `ROLLBACK TO SAVEPOINT` ile
 bırakıyor.
-- **Bu satır kaldırılınca:** 8 shard'lı eşzamanlılık testi kırmızıya döndü. Logda 352 "deadlock detected"
-  satırı ve 899 hatalı istek var.
+- **Bu satır kaldırılınca:** 8 shard'lı eşzamanlılık testi kırmızıya döndü. Logda 254 "deadlock detected"
+  satırı ve 895 hatalı istek var.
 - **Satır geri konunca:** Test yeşil, 0 deadlock.
 
 Not: Aşama 3'teki ilk ölçümde bu sayı 174'tü. Deadlock sayısı zamanlamaya bağlı; görseldeki sayı bu koşuya ait.
@@ -76,25 +76,19 @@ edilen "güvenli yön". Bir sonraki tur sayacı 90'a indirdi.
 - **A. Bellek yetersizliği:**
   - Kurulum: 128 MB heap, yük atma kapalı, 3.000 kullanıcı.
   - Instance'lar `OutOfMemoryError` aldı; JVM kapandı (`-XX:+ExitOnOutOfMemoryError`).
-  - Docker konteynerleri yeniden başlattı: toplam 5 yeniden başlatma, sonunda üçü de sağlıklı.
+  - Docker konteynerleri yeniden başlattı: toplam 6 yeniden başlatma, sonunda üçü de sağlıklı.
   - Bu ayardan önce OOM, Tomcat'in Acceptor thread'ini öldürüyordu: süreç yaşıyor, Docker "healthy" diyor,
     ama hiçbir istek cevaplanmıyordu.
 - **B. Donmuş JVM:**
-  - app2'ye `SIGSTOP` gönderildi. Healthcheck onu 13 sn içinde "unhealthy" yaptı.
+  - app2'ye `SIGSTOP` gönderildi. Healthcheck onu 14 sn içinde "unhealthy" yaptı.
   - nginx ilk zaman aşımından sonra ona trafik göndermeyi bıraktı.
-  - 100 istemcili 40 saniyelik koşuda 8.003 başarılı isteğe karşı 102 zaman aşımı oldu. Bu, pasif sağlık
+  - 100 istemcili 40 saniyelik koşuda 10.235 başarılı isteğe karşı 103 zaman aşımı oldu. Bu, pasif sağlık
     kontrolünün bedeli: zaman aşımı penceresinde her istemcinin bir isteği takılıyor.
+- **C. Aşırı yük, sağlıklı instance'lar:** 5.000 kullanıcı, yük atma kapalı. Hiçbir instance trafikten
+  çıkarılmadı; 0 tane 502/504 (Aşama 7a'daki nginx düzeltmesi).
 
-> **Bu görselin ham çıktısı sonradan filtrelendi.**
-> - **Ne oldu:** Koşu `bash bench/verify-failfast-live.sh | grep -v ' Container '` ile başlatıldı. Docker
->   Compose'un konteyner ilerleme satırları (`Container reservation-engine-app1-1  Recreate / Starting /
->   Healthy / Stopping ...`, yaklaşık 110 satır) stderr'e yazıldığı için `grep`'ten kaçtı ve çıktıya karıştı.
-> - **Silinenler:** Sadece içinde ` Container ` geçen satırlar `sed '/ Container /d'` ile silindi; testin kendi
->   satırlarına dokunulmadı.
-> - **İlk satır:** Bu komut da ` Container ` içerdiği için silinmişti. Yerine, filtrelenmiş çıktıyı doğrudan
->   üreten komut yazıldı: `... 2>&1 | grep -v ' Container '`.
-> - **Kalıcı düzeltme:** `render.sh` artık bu komutu kullanıyor; bir sonraki üretimde sonradan filtreleme
->   gerekmeyecek.
+Bu görselin ham çıktısı `render.sh` tarafından doğrudan `... 2>&1 | grep -v ' Container '` ile üretildi; elle
+filtreleme yok.
 
 ## Mimari
 
