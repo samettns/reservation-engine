@@ -32,7 +32,7 @@ x-app: &app
     SHED_MODE: ${SHED_MODE:-http}
     # Stage 8 benchmark switches (defaults = normal behaviour)
     SOLDOUT_SHORTCUTS: ${SOLDOUT_SHORTCUTS:-true}
-    TX_ORDER: ${TX_ORDER:-stock-first}
+    TX_ORDER: ${TX_ORDER:-stock-last}
     REDIS_VERIFY_SOLD_OUT: ${REDIS_VERIFY_SOLD_OUT:-always}
     RETRY_AFTER_MIN_S: ${RETRY_AFTER_MIN_S:-1}
     RETRY_AFTER_MAX_S: ${RETRY_AFTER_MAX_S:-3}

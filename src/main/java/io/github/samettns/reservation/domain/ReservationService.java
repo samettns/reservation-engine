@@ -56,9 +56,22 @@ public class ReservationService {
                               MeterRegistry meters,
                               DbStepLimiter dbStep,
                               @Value("${reservation.soldout-shortcuts.enabled:true}") boolean soldOutShortcuts,
-                              @Value("${reservation.tx-order:stock-first}") String txOrder) {
+                              @Value("${reservation.tx-order:stock-last}") String txOrder) {
         this(strategy, reservations, events, outbox, idempotency, tx, holdTtl, idempotencyLease, meters, () -> { }, dbStep,
-                soldOutShortcuts, "stock-last".equals(txOrder));
+                soldOutShortcuts, isStockLast(txOrder));
+    }
+
+    /**
+     * {@code stock-last} (default since stage 8) or {@code stock-first}. Anything else fails at
+     * startup: with stock-last as the default, a typo must not silently select the other order.
+     */
+    static boolean isStockLast(String txOrder) {
+        return switch (txOrder) {
+            case "stock-last" -> true;
+            case "stock-first" -> false;
+            default -> throw new IllegalArgumentException(
+                    "reservation.tx-order must be stock-last or stock-first, was: " + txOrder);
+        };
     }
 
     /** Package-private: only tests in this package can inject a pause; production always gets a no-op. */
@@ -74,7 +87,7 @@ public class ReservationService {
                        Duration holdTtl, Duration idempotencyLease, MeterRegistry meters, Runnable afterClaim,
                        DbStepLimiter dbStep) {
         this(strategy, reservations, events, outbox, idempotency, tx, holdTtl, idempotencyLease, meters, afterClaim,
-                dbStep, true, false);
+                dbStep, true, true);
     }
 
     /**
@@ -82,7 +95,7 @@ public class ReservationService {
      *                         writing of the marker: the stage 8 benchmark measures them on/off in
      *                         the same code.
      * @param stockLast        true = in the reservation transaction, the inserts first and the hot
-     *                         stock UPDATE last (stage 8 benchmark variant); false = stock first.
+     *                         stock UPDATE last (the default since stage 8); false = stock first.
      */
     ReservationService(ReservationStrategy strategy, ReservationRepository reservations, EventRepository events,
                        ReservationEvents outbox, IdempotencyRepository idempotency, TransactionTemplate tx,
@@ -108,7 +121,7 @@ public class ReservationService {
     public ReservationService(ReservationStrategy strategy, ReservationRepository reservations, EventRepository events,
                               ReservationEvents outbox, IdempotencyRepository idempotency, TransactionTemplate tx) {
         this(strategy, reservations, events, outbox, idempotency, tx, DEFAULT_HOLD_TTL, DEFAULT_IDEMPOTENCY_LEASE,
-                new SimpleMeterRegistry(), () -> { }, DbStepLimiter.unlimited(), true, false);
+                new SimpleMeterRegistry(), () -> { }, DbStepLimiter.unlimited(), true, true);
     }
 
     /**
@@ -150,7 +163,8 @@ public class ReservationService {
     }
 
     /**
-     * Variant "inserts first, hot stock UPDATE last" (stage 8 benchmark, an open item since 5a).
+     * "Inserts first, hot stock UPDATE last": the default since the stage 8 benchmark (+28..+65%
+     * reservations/s in contention for atomic and pessimistic, no loss in the flash sale).
      * The row lock on the hot stock row is taken as late as possible, so it is held for fewer
      * statements: UPDATE stock -> (shard fix-up if sharded) -> INSERT outbox -> COMMIT, instead of
      * UPDATE stock -> INSERT reservation -> INSERT outbox -> UPDATE claim -> COMMIT. (The outbox event

@@ -8,7 +8,8 @@
 # machine (heat, background work) does not favour one config. A config/rep with a complete
 # results.csv is skipped, so an interrupted batch can simply be started again.
 # Clients honour 503 + Retry-After (as in stage 7a). All app switches are environment variables,
-# so every comparison is the SAME code with ONE setting changed.
+# so every comparison is the SAME code with ONE setting changed. The published results were measured
+# with TX_ORDER=stock-first (the default until stage 8 closed), so A/B/C pin it explicitly.
 #
 #   BATCH=1 bash bench/run-final.sh ; BATCH=2 bash bench/run-final.sh
 #   python3 bench/summarize_final.py      -> docs/benchmarks/final/summary.md
@@ -22,15 +23,15 @@ ONLY=${ONLY:-}   # e.g. ONLY=D-stock-last runs just that config (smoke tests)
 
 # name | expected rows | environment
 CONFIGS_1=(
-  "A-strategies|20|BENCH_STRATEGIES=naive,atomic,optimistic,pessimistic,redis BENCH_MODES=contention,sellout BENCH_SHARDS=1"
+  "A-strategies|20|TX_ORDER=stock-first BENCH_STRATEGIES=naive,atomic,optimistic,pessimistic,redis BENCH_MODES=contention,sellout BENCH_SHARDS=1"
   "D-stock-last|8|TX_ORDER=stock-last BENCH_STRATEGIES=atomic,pessimistic BENCH_MODES=contention,sellout BENCH_SHARDS=1"
 )
 CONFIGS_2=(
-  "B-shards16|16|BENCH_STRATEGIES=atomic,optimistic,pessimistic,pessimistic-precheck BENCH_MODES=contention,sellout BENCH_SHARDS=16"
-  "B-precheck1|4|BENCH_STRATEGIES=pessimistic-precheck BENCH_MODES=contention,sellout BENCH_SHARDS=1"
-  "C-shortcuts-off|12|SOLDOUT_SHORTCUTS=false BENCH_STRATEGIES=atomic,pessimistic,redis BENCH_MODES=sellout BENCH_SHARDS=1,16"
-  "C-redis16-on|2|BENCH_STRATEGIES=redis BENCH_MODES=sellout BENCH_SHARDS=16"
-  "C-redis-verify-stale-only|4|REDIS_VERIFY_SOLD_OUT=stale-only BENCH_STRATEGIES=redis BENCH_MODES=sellout BENCH_SHARDS=1,16"
+  "B-shards16|16|TX_ORDER=stock-first BENCH_STRATEGIES=atomic,optimistic,pessimistic,pessimistic-precheck BENCH_MODES=contention,sellout BENCH_SHARDS=16"
+  "B-precheck1|4|TX_ORDER=stock-first BENCH_STRATEGIES=pessimistic-precheck BENCH_MODES=contention,sellout BENCH_SHARDS=1"
+  "C-shortcuts-off|12|TX_ORDER=stock-first SOLDOUT_SHORTCUTS=false BENCH_STRATEGIES=atomic,pessimistic,redis BENCH_MODES=sellout BENCH_SHARDS=1,16"
+  "C-redis16-on|2|TX_ORDER=stock-first BENCH_STRATEGIES=redis BENCH_MODES=sellout BENCH_SHARDS=16"
+  "C-redis-verify-stale-only|4|TX_ORDER=stock-first REDIS_VERIFY_SOLD_OUT=stale-only BENCH_STRATEGIES=redis BENCH_MODES=sellout BENCH_SHARDS=1,16"
 )
 case "${BATCH:-}" in
   1) CONFIGS=("${CONFIGS_1[@]}") ;;

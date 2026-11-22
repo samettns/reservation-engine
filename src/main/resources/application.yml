@@ -114,8 +114,10 @@ reservation:
   soldout-shortcuts:
     # false: no Redis/marker "sold out" shortcut and no marker writes (measures what they bring)
     enabled: ${SOLDOUT_SHORTCUTS:true}
-  # stock-first: take the stock unit, then insert; stock-last: inserts first, hot stock UPDATE last
-  tx-order: ${TX_ORDER:stock-first}
+  # stock-last (default since stage 8): inserts first, hot stock UPDATE last, so the row lock is
+  # held only UPDATE -> commit. stock-first: the stage 1-7 order (take the unit, then insert).
+  # Any other value fails at startup.
+  tx-order: ${TX_ORDER:stock-last}
   redis-gate:
     # always: a SOLD_OUT from the gate is confirmed by the DB before it becomes "sold out" (and the
     # DB's sold-out marker); stale-only: only while the counters are marked stale after an outage.
