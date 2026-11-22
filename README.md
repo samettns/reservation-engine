@@ -3,6 +3,10 @@
 Yüksek eşzamanlılık altında sınırlı stoğu satan (konser bileti, flaş indirim) ve
 **overselling'i önleyen** çekirdek servis. Arayüz yok; odak doğruluk ve ölçülebilir performans.
 
+**Ana bulgu:** Darboğaz kilitleme stratejisi değil, sıcak satır. 1 shard'da beş strateji arasında anlamlı fark yok;
+kazanç sharding'den (yazmada 3–6 kat) ve "tükendi" kısayollarından (flaş satışta 1,6–7,6 kat) geliyor
+([final benchmark](#final-benchmark-aşama-8)).
+
 > 🚧 Geliştirme aşamasında. Tam README (mimari, benchmark grafikleri, trade-off'lar) son aşamada eklenecek.
 
 **Gerçek koşulardan görseller** (hepsi ve açıklamaları: [`docs/showcase/`](docs/showcase/README.md)):
@@ -83,8 +87,9 @@ Kurulum: nginx arkasında 3 uygulama instance'ı, PostgreSQL 17, Redis 7.4, yük
 Hepsi **tek bir laptopta** (16 thread, WSL2) çalışıyor; sayılar mutlak değil, stratejiler arası **göreli**
 karşılaştırma için. Tam tablo: [`docs/benchmarks/summary.md`](docs/benchmarks/summary.md).
 
-> ⚠️ **Ön sonuç.** Bu bölümdeki tüm sayılar **tek koşuya** dayanıyor. Final benchmark'ta (Aşama 8) ana
-> konfigürasyonlar 3'er kez koşturulup ortalama ± standart sapma ile güncellenecek.
+> ⚠️ **Tarihsel sonuç (Aşama 2 kodu, tek koşu).** Güncel ve 3 tekrarlı sonuçlar:
+> [Final benchmark (Aşama 8)](#final-benchmark-aşama-8). Aradaki aşamalar her rezervasyona iş ekledi (ayrı claim
+> commit'i, outbox satırı); bu bölümdeki mutlak sayılar bugünkü kodla karşılaştırılamaz.
 
 > **`redis` sonuçları "saf Redis" değil, "Redis + PostgreSQL"dir.** Redis yalnızca bir kapı; kapıdan geçen her
 > istek PostgreSQL'de atomik UPDATE ve commit yapıyor, idempotency kontrolü de her istekte PostgreSQL'e gidiyor.
@@ -102,6 +107,8 @@ karşılaştırma için. Tam tablo: [`docs/benchmarks/summary.md`](docs/benchmar
   rezervasyon INSERT'ü dahil transaction sonuna kadar tuttuğu için kritik bölge daha uzun. `optimistic` her
   isteğe ortalama ~1 retry ekliyor. `redis` burada fayda sağlamıyor (stok bitmediği için herkes kapıdan
   geçiyor), sadece fazladan bir Redis gidiş-dönüşü ekliyor.
+- **Aşama 8'de tekrarlanmadı:** Bugünkü kodla, 3 tekrarda, 1 shard'da stratejiler arasındaki fark gürültüden
+  ayırt edilemiyor ([final benchmark, 1](#1-1-sharda-stratejiler-arasında-ölçülebilir-fark-yok)).
 
 **2. Flaş satış (1.000 stok, 20.000 istek; yanıtların %95'i "tükendi"):**
 
@@ -154,7 +161,8 @@ denendikten sonra veriliyor.** Sharding kilitleme stratejisinden bağımsız bir
 "tek satırdan bir birim al" işini yapıyor, hangi satırın deneneceğine `StockShards` karar veriyor.
 Komut: `bash bench/run-sharding.sh`. Tam tablo: [`docs/benchmarks/sharding/summary.md`](docs/benchmarks/sharding/summary.md).
 
-> ⚠️ **Ön sonuç** (tek koşu). Gürültü ölçüsü: aynı konfigürasyon iki ayrı koşuda 480 ve 626 rezervasyon/sn verdi.
+> ⚠️ **Tarihsel sonuç** (Aşama 3 kodu, tek koşu). Gürültü ölçüsü: aynı konfigürasyon iki ayrı koşuda 480 ve 626
+> rezervasyon/sn verdi. Güncel, 3 tekrarlı sonuç: [final benchmark, 2](#2-16-shard-yazmada-36-kat-flaş-satışta-da-hızlı).
 
 **1. Yazma throughput'u (stok bitmiyor): 16 shard ile 3–5 kat.**
 
@@ -291,7 +299,9 @@ Bu, Aşama 1'deki açığı **bütün stratejiler için** kapattı: aynı key'li
   (işaret kendiliğinden geçersizleşiyor) ve Redis sayacı artıyor (kısayol kapanıyor). İkisi de testli.
 - **Kısayol bile idempotency'ye bakıyor:** Başarılı bir isteğin tekrarı "tükendi" değil, kendi sonucunu alıyor.
 
-**Flaş satış, önce / sonra** (aynı makine, aynı oturumda arka arkaya ölçüldü; ⚠️ ön sonuç, tek koşu).
+**Flaş satış, önce / sonra** (aynı makine, aynı oturumda arka arkaya ölçüldü; ⚠️ tarihsel sonuç, tek koşu;
+"önce" Aşama 5a kodu, claim yok). Bugünkü kodla kısayollar açık / kapalı:
+[final benchmark, 4](#4-tükendi-kısayollarının-kazancı-redise-özgü-değil).
 Tam tablo: [`docs/benchmarks/sellout-5b/summary.md`](docs/benchmarks/sellout-5b/summary.md).
 
 <picture>
@@ -313,8 +323,8 @@ Tam tablo: [`docs/benchmarks/sellout-5b/summary.md`](docs/benchmarks/sellout-5b/
   1 Redis + 1 okuma.
 - Satılmamış stok hiçbir koşuda kalmadı; overselling yok.
 - **Bedeli:** Başarılı her rezervasyon artık bir commit fazla yapıyor (claim). Bu ölçümde 20.000 istekten
-  sadece 1.000'i başarılı olduğu için etkisi küçük. Yazma ağırlıklı senaryodaki etkisi final benchmark'ta (Aşama 8)
-  ölçülecek.
+  sadece 1.000'i başarılı olduğu için etkisi küçük. Yazma ağırlıklı senaryodaki etkisi ayrıca ölçülmedi (claim'i
+  kapatan bir anahtar yok; bkz. Bilinen sınırlamalar).
 
 ## Dağıtık kilit, fencing token ve Redis–DB mutabakatı (Aşama 6)
 
@@ -670,9 +680,9 @@ Bu aşamada eklenenler:
   - Kısayolun yanlış "tükendi"si hiçbir şey yazmıyor ve mutabakatla düzeliyor. Kapının `SOLD_OUT`'u ise DB'deki
     "tükendi" işaretine yazılıyor; bütün stratejiler bu işarete güveniyor ve mutabakat onu onarmıyor. Kalıcı ve
     paylaşılan bir yalanın girdisi doğrulanmalı.
-  - Bedeli: kapıya ulaşan nadir istek başına bir kilitsiz DB çağrısı, zaten açık olan transaction'ın içinde.
-    Final benchmark'ta (C) "her zaman" ile "sadece bayatken" ayrı ölçülüyor; kapıya kaç isteğin ulaştığı da
-    kaydediliyor.
+  - Bedeli: kapıya ulaşan nadir istek başına bir DB çağrısı, zaten açık olan transaction'ın içinde. "Her zaman"
+    ile "sadece bayatken" final benchmark'ta ölçüldü; fark bu kadar az isteğin maliyetiyle açıklanamıyor
+    ([final benchmark, 5](#5-redis-kapısında-tükendi-doğrulaması-her-zaman--sadece-bayatken)).
 - **Dönüşte hemen mutabakat:** Bir olay tetikleniyor, 30 sn beklenmiyor. İşareti sadece başarılı bir tur
   siliyor (karşılaştır-ve-sil).
 - **Sonuç:** Dönüşten hemen sonraki istek birimi satıyor. Dönüş anında Redis DB'den asla düşük değil; bir
@@ -696,11 +706,156 @@ Konteyner öldürme denemesinden iki not:
 - 10 sn'lik bağlantı zaman aşımı bir takas. 2 sn, aşırı yükte sağlıklı instance'ları çıkarıyordu; 10 sn, ölü
   instance'a gönderilen isteği 10 sn geciktiriyor. Aktif sağlık kontrolü bu takası ortadan kaldırır.
 
+## Final benchmark (Aşama 8)
+
+Önceki bölümlerdeki benchmark'lar o aşamanın kodu ve tek koşuydu. Bu bölüm **bugünkü kodu** ölçüyor.
+
+- **Koşullar:** 3 tekrar, 100 ve 1.000 kullanıcı, ortalama ± standart sapma. İstemci `Retry-After`'a uyuyor; yük
+  atma varsayılan ayarında (HTTP girişinde 100). Kafka olayları ve mutabakat, önceki benchmark'larda olduğu gibi
+  kapalı.
+- **Transaction sırası:** 1–5. maddeler eski sırayla (`TX_ORDER=stock-first`) ölçüldü. "Stok en sonda" sırası bu
+  ölçümden sonra varsayılan oldu (6. madde); `bench/run-final.sh` eski sırayı açıkça seçiyor.
+- **Aynı kod, tek ayar farkı:** Her karşılaştırmada sadece bir ortam değişkeni değişiyor (`BENCH_SHARDS`,
+  `SOLDOUT_SHORTCUTS`, `TX_ORDER`, `REDIS_VERIFY_SOLD_OUT`).
+- **Tekrarlar iç içe:** Önce her konfigürasyonun 1. tekrarı, sonra 2.'si... Makinenin zamanla yavaşlaması bir
+  konfigürasyonu kayırmıyor.
+- **Doğruluk:** 49 koşu grubunun hiçbirinde `naive` dışında fazla satış yok. k6'nın saydığı 201'ler her koşuda
+  DB'deki rezervasyonlara eşit. Yeniden başlayan instance ve 500 yok.
+- Komut: `BATCH=1 bash bench/run-final.sh; BATCH=2 bash bench/run-final.sh; python3 bench/summarize_final.py`.
+  Tam tablo, her tekrarın değeriyle: [`docs/benchmarks/final/summary.md`](docs/benchmarks/final/summary.md).
+
+Aşağıdaki tablolarda değerler başarılı rezervasyon/sn.
+
+### 1. 1 shard'da stratejiler arasında ölçülebilir fark yok
+
+| | Contention, 100 | Contention, 1.000 | Flaş satış, 100 | Flaş satış, 1.000 |
+|---|---:|---:|---:|---:|
+| atomic | 288 ± 41 | 280 ± 26 | 187 ± 39 | 118 ± 8 |
+| optimistic | 293 ± 30 | 269 ± 21 | 156 ± 16 | 114 ± 10 |
+| pessimistic | 296 ± 33 | 269 ± 28 | 158 ± 23 | 113 ± 11 |
+| pessimistic + pre-check | 335 ± 15 | 303 ± 3 | 175 ± 7 | 126 ± 11 |
+| redis | 294 ± 55 | 292 ± 39 | 175 ± 11 | 130 ± 3 |
+
+- Bütün farklar standart sapmaların içinde. **Aşama 2'deki "atomic en hızlısı" sonucu bugünkü kodla
+  tekrarlanmadı.** O ölçüm tek koşuydu; tek koşu iki ayrı denemede %30'a varan fark verebiliyor.
+- Pessimistic'in flaş satıştaki zayıflığı (Aşama 2'de 2,7–3,8 kat yavaş) kayboldu: versiyonlu "tükendi" işareti
+  satır kilidinden önce cevap veriyor (4. madde).
+- Tek shard'ın tavanı ~290/sn. Aşama 2'deki ~600'ün yarısı; arada her rezervasyona ayrı bir claim commit'i ve
+  bir outbox satırı eklendi. Claim'in payı ayrıca ölçülmedi.
+
+### 2. 16 shard: yazmada 3–6 kat, flaş satışta da hızlı
+
+| | Contention, 100: 1 → 16 shard | Contention, 1.000: 1 → 16 | Flaş satış, 100: 1 → 16 | Flaş satış, 1.000: 1 → 16 |
+|---|---:|---:|---:|---:|
+| atomic | 288 → 1.433 (5,0×) | 280 → 1.689 (6,0×) | 187 → 287 (1,5×) | 118 → 176 (1,5×) |
+| optimistic | 293 → 1.171 (4,0×) | 269 → 1.482 (5,5×) | 156 → 277 (1,8×) | 114 → 175 (1,5×) |
+| pessimistic | 296 → 1.135 (3,8×) | 269 → 1.448 (5,4×) | 158 → 315 (2,0×) | 113 → 188 (1,7×) |
+| pessimistic + pre-check | 335 → 1.092 (3,3×) | 303 → 901¹ | 175 → 290 (1,7×) | 126 → 167 (1,3×) |
+
+- Contention'da başarılı isteğin p99'u da düşüyor (atomic: 1,3 sn → 0,28 sn, 1,7 sn → 0,46 sn).
+- **Aşama 3'teki "sharding 'tükendi'yi pahalılaştırıyor" sorunu artık yok:** Versiyonlu "tükendi" işareti
+  sayesinde 16 shard flaş satışta da 1 shard'dan 1,3–2,0 kat hızlı.
+
+¹ Yeniden koşulan 3 tekrar: 958 / 881 / 862 (901 ± 51). İlk 3 tekrar 393 / 1.337 / 1.403'tü. İlki aykırı değer:
+2.303 Hikari zaman aşımı (diğerlerinde 49–60). Yeniden koşu ayrı bir oturumda yapıldı ve aynı oturumda
+pessimistic ölçülmedi; bu hücreyi pessimistic ile karşılaştırmayın. Altı koşunun hepsinde throughput, Hikari
+zaman aşımı sayısıyla ters yönde değişiyor (178–469 zaman aşımında 862–958/sn).
+
+### 3. Pessimistic + pre-check: artık gerek yok
+
+- Aşama 3'te ön kontrol, flaş satışta pessimistic'i 2,5–4,3 kat hızlandırıyordu. Bugün fark gürültü sınırında
+  (175 ± 7 / 158 ± 23 ve 126 ± 11 / 113 ± 11). Contention'da da öyle (335 ± 15 / 296 ± 33).
+- Neden: versiyonlu "tükendi" işareti, stok bittikten sonraki istekleri ön kontrolden de önce cevaplıyor.
+  Ön kontrolün çözdüğü problemi artık işaret çözüyor.
+
+### 4. "Tükendi" kısayollarının kazancı Redis'e özgü değil
+
+Flaş satış, kısayollar kapalı → açık (`SOLDOUT_SHORTCUTS=false` / varsayılan):
+
+| | 1 shard, 100 | 1 shard, 1.000 | 16 shard, 100 | 16 shard, 1.000 |
+|---|---:|---:|---:|---:|
+| atomic | 70 → 187 (2,7×) | 74 → 118 (1,6×) | 88 → 287 (3,3×) | 67 → 176 (2,6×) |
+| pessimistic | 31 → 158 (5,2×) | 31 → 113 (3,7×) | 41 → 315 (7,6×) | 37 → 188 (5,1×) |
+| redis | 62 → 175 (2,8×) | 68 → 130 (1,9×) | 80 → 146 (1,8×) | 64 → 130 (2,0×) |
+
+- **Kazanç DB tarafındaki versiyonlu "tükendi" işaretinden geliyor.** Kısayollar açıkken `redis` 1 shard'da
+  `atomic` ile aynı seviyede (175 / 187, 130 / 118), 16 shard'da ise geride (146 / 287, 130 / 176). Redis'in kendi
+  kısayolu (sayaç 0 ise tek `GET`), bütün DB stratejilerinin kullandığı işaretin üstüne ölçülebilir bir şey
+  eklemiyor. 16 shard'da `redis`'in neden geride kaldığı ölçülmedi.
+- **Neden bu kadar büyük:** Kısayol kapalıyken her "tükendi" isteği üç transaction açıyor: claim'i commit et,
+  stoğu dene (16 shard'da 16 satır), claim'i bırak. Açıkken claim'den önce tek bir PK okuması yetiyor.
+  Pessimistic en çok kazanıyor, çünkü kısayolsuz her "tükendi" için `FOR UPDATE` alıyor.
+- **Aşama 5b'deki önce / sonra ile karşılaştırılamaz** (+%14 ile +%307): oradaki "önce"de claim yoktu, "tükendi"
+  isteği tek transaction'dı.
+
+### 5. Redis kapısında "tükendi" doğrulaması: her zaman / sadece bayatken
+
+**Varsayılan "her zaman" kalıyor.** `REDIS_VERIFY_SOLD_OUT=stale-only`, çok shard'lı kurulumda bir opsiyon;
+**Redis kesintisi ve bayat veri senaryolarında doğrulanmadı.**
+
+| Flaş satış, `redis` | her zaman (varsayılan), tekrarlar | sadece bayatken, tekrarlar | Fark |
+|---|---|---|---|
+| 16 shard, 100 | 148 / 143 / 147 | 300 / 310 / 547 | Medyanda ~2,1×, bir tekrarda 3,7× |
+| 16 shard, 1.000 | 135 / 117 / 139 | 241 / 185 / 184 | Medyanda ~1,4× |
+| 1 shard, 100 | 175 ± 11 | 133 / 114 / 107 (118 ± 13) | %33 **yavaş** |
+| 1 shard, 1.000 | 130 ± 3 | 99 / 108 / 95 (101 ± 7) | %22 **yavaş** |
+
+- **"Yanlış tükendi = 0" bir güvenlik kanıtı değil.** `stale-only` modunda kapının cevabı DB'ye hiç sorulmuyor;
+  "DB'de stok vardı" sayacı bu modda yapısı gereği 0 kalıyor. Bu koşularda Redis kesintisi de yoktu.
+- Varsayılan modda kesintisiz koşularda da kapının "tükendi" dediği 23–35 durumda DB'de birim bulundu. Bunlar
+  büyük ihtimalle commit'i henüz bitmemiş uçuştaki rezervasyonların birimleri (doğrulanmadı).
+- **Farkın nedeni açıklanamadı, iki yönde de.** Doğrulama, koşu başına sadece kapıya ulaşan 19–165 isteğe
+  dokunuyor; ölçülen fark (−%33 ile +%110) bu kadar az isteğin maliyetiyle açıklanamıyor.
+  - 1 shard için sınanan hipotez: "Tükendi" daha hızlı dönünce istemciler daha sık istek atar, tek satırda kilit
+    çekişmesi artar. **Desteklenmedi:** `stale-only`'de istek/sn (2.365 / 3.498) ve kilit bekleme oranı
+    (%43 / %68) daha *düşük*. Sadece LWLock beklemesi daha yüksek (%52 / %28).
+
+### 6. "Önce INSERT'ler, stok UPDATE'i en sonda" (artık varsayılan)
+
+Rezervasyon transaction'ında sıcak stok satırı en son güncelleniyor; satır kilidi sadece UPDATE'ten commit'e kadar
+tutuluyor. **Aşama 8'in sonunda varsayılan oldu.** Eski sıra `TX_ORDER=stock-first` ile seçilebiliyor; başka bir
+değer uygulamayı başlatmıyor (yazım hatası sessizce diğer sırayı seçmesin).
+
+| 1 shard | Contention, 100 | Contention, 1.000 | Flaş satış, 100 | Flaş satış, 1.000 |
+|---|---:|---:|---:|---:|
+| atomic: stok önce → en sonda | 288 → 474 (+%65) | 280 → 441 (+%58) | 187 → 210 | 118 → 143 |
+| pessimistic: stok önce → en sonda | 296 → 378 (+%28) | 269 → 350 (+%30) | 158 → 219 | 113 → 136 |
+
+- **Contention'da büyük kazanç:** Atomic'te başarılı isteğin p99'u 1,3 sn'den 0,77 sn'ye düşüyor. Tekrarlar
+  arası sapma da küçülüyor (±41 → ±8).
+- **Beklenen bedel ölçülmedi:** Stok bittiğinde INSERT'ler boşa yapılıp geri alınıyor. Ama flaş satışta
+  "tükendi" isteklerinin neredeyse hepsi kısayoldan cevap alıyor ve transaction'a hiç girmiyor. Flaş satış
+  sonuçları stok önceki sıradan kötü değil.
+- **Performans kazancı sadece `atomic` ve `pessimistic` için ölçüldü.** `optimistic`, `pessimistic-precheck` ve
+  `redis` için ölçülmedi; bu stratejilerde sadece doğruluğu test edildi.
+- **Doğruluk, her strateji için 1 ve 16 shard'da test edildi** (`StockLastTransactionTest`):
+  - Eşzamanlılıkta tam stok kadar satış, rezervasyon başına tek olay, sonuçsuz kalan her key serbest.
+  - Tükenince erken INSERT'ler geri alınıyor: rezervasyon, olay ve claim kalmıyor. Bir birim iade edilince aynı key
+    ile istek başarılı oluyor ve birimin geldiği shard'ı kaydediyor.
+  - Mutasyon kontrolü: geri almayı kaldırmak 28 testi, shard düzeltmesini kaldırmak 1 testi kırmızıya çeviriyor.
+- **Varsayılanı değiştirmek bir hata buldu (`redis`):** Stock-last'te "tükendi" transaction'ı commit etmek
+  yerine geri alınıyor. Redis kapısının geri alma telafisi (`INCR`), DB'de hiç birimi olmayan bir düşüşü de
+  iade ediyordu: kapıdaki doğrulama, uçuştaki bir isteğin birimini aldığında sayaç DB'den bir yüksek kalıyordu
+  (testte 1–7). Telafi artık sadece DB gerçekten bir birim verdiyse yapılıyor. Stock-first'te davranış aynı
+  (orada bu transaction zaten commit ediyordu).
+
+### Ölçüm notları
+
+- **İlk tekrar etkisi:** Sadece `A-strategies`'in 1. tekrarı sistematik olarak düşük (medyanda %11; 16 hücrenin
+  9'unda %15'ten fazla). Diğer konfigürasyonların 1. tekrarı 2. ve 3. ile aynı (medyan oran 0,98–1,05).
+  - Her strateji instance'larını yeniden başlatıp 10 sn ısınıyor ve sonraki konfigürasyonlarda etki yok. Bu
+    yüzden koşu başına ısınma süresi yetersiz değil.
+  - `A-strategies`'in 1. tekrarı, bellek azlığı yüzünden yarıda kesilen bir oturumun ilk konfigürasyonuydu.
+  - Tekrarlar iç içe olduğu için bu etki stratejileri eşit etkiliyor; karşılaştırmayı değil, mutlak değerleri
+    biraz düşürüyor.
+- Tek bir laptop (16 thread, WSL2): k6, nginx, 3 JVM, PostgreSQL ve Redis aynı CPU'yu paylaşıyor. Mutlak sayılar
+  bu makineye özgü.
+
 ## Bilinen sınırlamalar
 
 | Sınırlama | Etki | Çözüm planı |
 |---|---|---|
-| **Idempotency claim'i her başarılı rezervasyona bir commit ekliyor.** | Yazma ağırlıklı senaryoda throughput'a etkisi henüz ölçülmedi. | Aşama 8 (final benchmark). |
+| **Idempotency claim'i her başarılı rezervasyona bir commit ekliyor.** | Yazma ağırlıklı senaryoda throughput'a etkisi ayrıca ölçülmedi: final benchmark'ta claim'i kapatan bir anahtar yok. Bugünkü 1 shard tavanı (~290/sn) Aşama 2'nin ~600'ünün yarısı, ama aradaki farka claim dışında başka değişiklikler de katkı veriyor. | Claim'i kapatan bir benchmark anahtarı ile ölçmek (açık). |
 | **Zehirli mesaj partition'ı durdurabilir.** Consumer'da işlenemeyen bir mesaj yeniden denenirken aynı partition'daki sonraki mesajlar bekliyor (geliştirme sırasında bir NULL hatasıyla yaşandı). | Bir hata, bir partition'daki bütün olayları geciktirir. | **Aşama 7a'da çözüldü:** 3 deneme, sonra dead-letter topic. |
 | **DLT'deki mesajları yeniden yayınlayan bir araç yok.** | Hata düzeltilince mesajlar elle yeniden yayınlanmalı (consumer idempotent olduğu için güvenli). | Kapsam dışı; `reservation.consumer.dead_lettered` sayacı ve ERROR log'u alarm için var. |
 | **Yük atma limiti HTTP girişinde ve sabit (100).** DB adımında 20 denendi, daha kötü çıktı: "tükendi" okuması da bağlantı havuzunu kullandığı için havuz kuyruğu sınırsız kaldı (Aşama 7a, ikinci tur). | Contention'da p99 2,0–2,4 sn; limit 20 bunu yarıya indirebilirdi. | Aşama 8: "tükendi" işaretini havuz dışına almak (Redis/bellek) ya da okumalara ayrı havuz, sonra DB adımında ≈ havuz boyutu; ya da adaptive concurrency. |
