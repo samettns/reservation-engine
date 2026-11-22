@@ -106,7 +106,7 @@ karşılaştırma için. Tam tablo: [`docs/benchmarks/summary.md`](docs/benchmar
   isteğe ortalama ~1 retry ekliyor. `redis` burada fayda sağlamıyor (stok bitmediği için herkes kapıdan
   geçiyor), sadece fazladan bir Redis gidiş-dönüşü ekliyor.
 - **Aşama 8'de tekrarlanmadı:** Bugünkü kodla, 3 tekrarda, 1 shard'da stratejiler arasındaki fark gürültüden
-  ayırt edilemiyor ([final benchmark, 1](#1-1-sharda-stratejiler-arasında-ölçülebilir-fark-yok)).
+  ayırt edilemiyor ([final benchmark, 1](#1-1-shardda-stratejiler-arasında-ölçülebilir-fark-yok)).
 
 **2. Flaş satış (1.000 stok, 20.000 istek; yanıtların %95'i "tükendi"):**
 
