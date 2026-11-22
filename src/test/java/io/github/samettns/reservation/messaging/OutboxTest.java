@@ -76,9 +76,18 @@ class OutboxTest extends IntegrationTest {
     @Autowired
     MeterRegistry meters;
 
-    /** Other test classes write outbox rows too; start every test with nothing pending. */
+    /**
+     * Other test classes leave due holds (e.g. an expired hold that was confirmed too late, 410) and
+     * outbox rows behind; the sweeper and the counts here are global. Start every test with neither:
+     * expire what is due first (that writes outbox rows), then mark every pending row published.
+     * (Surefire's class order depends on the file system: on the CI runner a leftover due hold made
+     * the sweep count 51 instead of 50.)
+     */
     @BeforeEach
-    void markEarlierEventsPublished() {
+    void startWithNothingDueAndNothingPending() {
+        while (sweeper().sweepOnce() > 0) {
+            // drain
+        }
         jdbc.sql("UPDATE outbox SET published_at = now() WHERE published_at IS NULL").update();
     }
 

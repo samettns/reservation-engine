@@ -3,10 +3,16 @@ package io.github.samettns.reservation.chaos;
 import eu.rekawek.toxiproxy.Proxy;
 import eu.rekawek.toxiproxy.ToxiproxyClient;
 import eu.rekawek.toxiproxy.model.Toxic;
+import io.github.samettns.reservation.strategy.CircuitBreaker;
+import io.github.samettns.reservation.strategy.RedisGateStrategy;
 import io.github.samettns.reservation.support.StockInvariant;
 import org.junit.jupiter.api.AfterEach;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.data.redis.connection.RedisConnection;
+import org.springframework.data.redis.core.RedisCallback;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.GenericContainer;
@@ -17,6 +23,9 @@ import org.testcontainers.kafka.KafkaContainer;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.time.Duration;
+
+import static org.awaitility.Awaitility.await;
 
 /**
  * Base for the fault-injection tests (stage 7b). The application reaches PostgreSQL, Redis and
@@ -82,7 +91,19 @@ public abstract class ChaosIntegrationTest {
         registry.add("spring.kafka.bootstrap-servers", () -> TOXIPROXY.getHost() + ":" + TOXIPROXY.getMappedPort(8668));
     }
 
-    /** Every test leaves the network healthy for the next one. */
+    @Autowired
+    RedisGateStrategy redisGate;
+    @Autowired
+    StringRedisTemplate redisTemplate;
+
+    /**
+     * Every test leaves the network healthy for the next one, and that includes the APPLICATION's
+     * view of it: re-enabling a proxy is not enough. Right after a Redis outage the app's Lettuce
+     * connection is still reconnecting and the gate's circuit breaker may be open; a test starting
+     * then (the CI runner's class order put RedisRecoveryTest right after RedisOutageTest) had its
+     * first request skip Redis (fail open) and waited 20 s for a counter that was never created.
+     * So wait until the app's own connection answers PING and the breaker is closed again.
+     */
     @AfterEach
     void healTheNetwork() throws IOException {
         for (Proxy proxy : new Proxy[]{POSTGRES_PROXY, REDIS_PROXY, KAFKA_PROXY}) {
@@ -91,5 +112,10 @@ public abstract class ChaosIntegrationTest {
             }
             proxy.enable();
         }
+        await().atMost(Duration.ofSeconds(20)).pollInterval(Duration.ofMillis(100)).ignoreExceptions().until(() -> {
+            redisGate.knownSoldOut(Long.MIN_VALUE);   // a real gate call: lets the breaker's probe through
+            return "PONG".equals(redisTemplate.execute((RedisCallback<String>) RedisConnection::ping))
+                    && redisGate.breakerState() == CircuitBreaker.State.CLOSED;
+        });
     }
 }
